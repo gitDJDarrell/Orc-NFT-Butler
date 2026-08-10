@@ -1231,6 +1231,44 @@ install). That means:
   fine there). Run `npm run service:install` from a normal terminal window
   on your own desktop, not from a remote/headless/CI context.
 
+### Install requires an elevated shell, and `Access is denied` (0x80070005)
+
+`npm run service:install` must be run from an **administrator** PowerShell:
+
+```bash
+cd "C:\Users\User\nft-defi-agent"; npm run service:install
+```
+
+The script now detects a non-elevated shell and says so up front, instead of
+surfacing a raw `Register-ScheduledTask : Access is denied.` CIM exception.
+
+Two things make the registration itself least-privilege, and both matter for
+avoiding `0x80070005`:
+
+- **The logon trigger is scoped to your own account.**
+  `New-ScheduledTaskTrigger -AtLogOn` *without* `-User` creates an "at log on
+  of **any** user" trigger — a machine-wide operation that needs more rights
+  than registering a task for yourself. (Symptom to look for: the task's XML
+  shows a bare `<LogonTrigger />` with no `<UserId>`.) The trigger is now
+  bound to the current user's account.
+- **The task is not elevated.** The principal is `LogonType Interactive` /
+  `RunLevel Limited` (`InteractiveToken` / `LeastPrivilege` in XML). The bot
+  only needs its own project directory and outbound HTTPS, so it never asks
+  for admin, and no password is ever stored.
+
+If `Register-ScheduledTask` still fails, the script automatically retries via
+`schtasks.exe /Create /XML`, which takes a different code path and sometimes
+succeeds where the CIM-backed cmdlet does not. Each task is registered
+independently and the outcome is reported per task, so a partial install is
+handled gracefully — the logon task alone still gives you start-at-logon, and
+the watchdog alone still recovers the bot within 5 minutes.
+
+Verify afterwards (read-only, works without elevation):
+
+```bash
+schtasks /query /tn OrcButlerBot /v /fo list
+```
+
 ## Watchlist filters
 
 `watchlist.json` (path configurable via `WATCHLIST_CONFIG_PATH`) is an
