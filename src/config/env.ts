@@ -155,8 +155,13 @@ const envSchema = z.object({
    * address is resolved and tracked. Resolution is one read-only eth_call;
    * no key, no wallet connection, no ability to sign or spend — see
    * src/portfolio/portfolio.ts.
+   *
+   * Operator-supplied, with NO built-in default: this ships empty so the
+   * repository never carries anyone's personal ENS identity. Set it (or
+   * PORTFOLIO_ADDRESS) in .env to enable /portfolio; leaving both blank
+   * simply reports the portfolio as unconfigured.
    */
-  PORTFOLIO_ENS_NAME: z.string().optional().default("neworc.eth"),
+  PORTFOLIO_ENS_NAME: z.string().optional().default(""),
   /** Optional explicit 0x address, skipping ENS resolution entirely. Still strictly read-only. */
   PORTFOLIO_ADDRESS: z.string().optional().default(""),
   /**

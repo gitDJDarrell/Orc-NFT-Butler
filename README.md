@@ -84,9 +84,24 @@ src/
                 unit-testable without a live connection
   index.ts      CLI entry point
 public/         static dashboard frontend (index.html, style.css, app.js)
+watchlist.example.json
+                tracked template for the file below — copy it to start
 watchlist.json  allowlist-only bid-lead config + global /config overrides —
-                edit this (or use /config) to change what the bot watches
+                edit this (or use /config) to change what the bot watches.
+                GITIGNORED: it holds your real buy triggers (see below)
 ```
+
+`watchlist.json` is deliberately **not** tracked. It encodes actual target
+prices, floor caps, and spread bounds for collections you're really trading —
+that's strategy, not shareable config. Start from the template:
+
+```bash
+cp watchlist.example.json watchlist.json
+```
+
+Both example entries ship with `"enabled": false`, so a fresh copy polls
+nothing until you edit it (or add collections from Discord with
+`/watchlist add`).
 
 ### Local state files (all gitignored)
 
@@ -966,9 +981,14 @@ How it works:
 
 ### Portfolio (read-only) 📦
 
-`/portfolio` resolves `PORTFOLIO_ENS_NAME` (default `neworc.eth`) to its
-public address and reports holdings grouped by collection, each collection's
-floor and estimated value, and a bounded sample of offers received.
+`/portfolio` resolves `PORTFOLIO_ENS_NAME` to its public address and reports
+holdings grouped by collection, each collection's floor and estimated value,
+and a bounded sample of offers received.
+
+The address is **operator-supplied and has no default** — set either
+`PORTFOLIO_ENS_NAME=<your-ens-name>` (e.g. `yourname.eth`) or
+`PORTFOLIO_ADDRESS=<your-0x-address>` in `.env`. With both blank, `/portfolio`
+reports that no portfolio is configured. Nothing personal ships in this repo.
 
 > **This feature is strictly, structurally read-only.** The bot holds **no
 > private key or seed phrase** — there is no configuration option to supply
@@ -1062,11 +1082,12 @@ instead; leave it blank to register everywhere the bot already is.
 scope.** If the bot was invited before this feature existed — with only the
 `bot` scope — command registration will fail with a "Missing Access" error
 in the logs, and no commands will appear in Discord. Fix it by re-inviting
-the bot with both scopes using this URL (replace nothing — it's already
-scoped to this bot's client ID):
+the bot with both scopes using this URL, substituting your application's
+client ID (Developer Portal → your app → General Information → Application
+ID):
 
 ```
-https://discord.com/oauth2/authorize?client_id=1533900068837654759&permissions=68672&scope=bot%20applications.commands
+https://discord.com/oauth2/authorize?client_id=<YOUR_BOT_CLIENT_ID>&permissions=68672&scope=bot%20applications.commands
 ```
 
 Re-authorizing an already-added bot through this URL doesn't remove it or
@@ -1233,10 +1254,11 @@ install). That means:
 
 ### Install requires an elevated shell, and `Access is denied` (0x80070005)
 
-`npm run service:install` must be run from an **administrator** PowerShell:
+`npm run service:install` must be run from an **administrator** PowerShell,
+from the project directory:
 
 ```bash
-cd "C:\Users\User\nft-defi-agent"; npm run service:install
+npm run service:install
 ```
 
 The script now detects a non-elevated shell and says so up front, instead of
@@ -1307,9 +1329,13 @@ schtasks /query /tn OrcButlerBot /v /fo list
 further, specific token IDs / traits / owner wallets within it — only ever
 produces a bid lead if it appears here as an enabled entry, and only once it
 passes every filter on that entry. Nothing outside this file is ever
-evaluated for bid leads. See the three example entries in `watchlist.json`
-(two enabled, one disabled placeholder) — edit collection addresses and
-thresholds to match what you actually want to watch.
+evaluated for bid leads.
+
+The file itself is gitignored — copy `watchlist.example.json` to
+`watchlist.json` to start. The template has two entries (both disabled) that
+between them exercise every filter type, so it doubles as a format reference:
+edit the collection addresses and thresholds to match what you actually want
+to watch, then flip `"enabled": true`.
 
 This is separate from the simpler `WATCHED_COLLECTIONS` list used by the
 dashboard's floor/new-listing view — that one is not allowlist-gated and

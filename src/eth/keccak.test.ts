@@ -41,5 +41,5 @@ test("namehash: 'vitalik.eth' matches the published EIP-137 example", () => {
 });
 
 test("namehash: is case-insensitive", () => {
-  assert.equal(namehashHex("NewOrc.ETH"), namehashHex("neworc.eth"));
+  assert.equal(namehashHex("MixedCase.ETH"), namehashHex("mixedcase.eth"));
 });

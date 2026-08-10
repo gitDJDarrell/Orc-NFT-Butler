@@ -425,7 +425,7 @@ async function handlePortfolio(deps: CommandRouterDeps): Promise<CommandReply> {
   if (!snapshot) {
     return {
       content:
-        "No portfolio address is configured or resolvable. Set `PORTFOLIO_ENS_NAME` (e.g. `neworc.eth`) or `PORTFOLIO_ADDRESS` in `.env`, then restart. " +
+        "No portfolio address is configured or resolvable. Set `PORTFOLIO_ENS_NAME` (e.g. `yourname.eth`) or `PORTFOLIO_ADDRESS` (a 0x address) in `.env`, then restart. " +
         "This view is strictly read-only — it never needs a private key.",
       ephemeral: true,
     };

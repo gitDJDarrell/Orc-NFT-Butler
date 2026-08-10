@@ -23,6 +23,14 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# --- Operator config (not state, but not publishable either) ---
+# watchlist.json encodes real buy triggers — target prices, floor caps, spread
+# bounds — for collections actually being traded. That's strategy, not config
+# worth publishing. The tracked template is watchlist.example.json; copy it to
+# watchlist.json (or build one from Discord with /watchlist add).
+watchlist.json
+!watchlist.example.json
+
 # --- Runtime state / locks / pids ---
 # Glob rather than an explicit list so a newly-added store (watched items,
 # whales, floor history, ...) is ignored by default instead of being

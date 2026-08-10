@@ -1,0 +1,69 @@
+{
+  "settings": {
+    "showUsd": true,
+    "floorMoveThresholdPercent": 5,
+    "newListingMaxPrice": 0.5,
+    "offerAboveCollectionThresholdPercent": 10,
+    "trendAlertTimes": "08:00,20:00",
+    "dailyRecapTime": "07:00"
+  },
+  "entries": [
+    {
+      "id": "example-blue-chip",
+      "label": "Example Blue Chip Collection",
+      "enabled": false,
+      "priorityTier": "blue-chip",
+      "collection": "0x0000000000000000000000000000000000000000",
+      "filters": {
+        "priceBand": {
+          "maxFloor": 10,
+          "targetBuyPrice": 5
+        },
+        "bidSpread": {
+          "minPercentFromFloor": -25,
+          "maxPercentFromFloor": 5
+        },
+        "liquidity": {
+          "minOwners": 1000,
+          "minVolume24hNative": 5
+        },
+        "trend": {
+          "minFloorMovePercent": 5
+        }
+      },
+      "quietHours": {
+        "start": "23:00",
+        "end": "07:00",
+        "timezone": "UTC"
+      },
+      "muted": false,
+      "dedupeWindowMinutes": 30,
+      "rateLimitPerHour": 10
+    },
+    {
+      "id": "example-targeted",
+      "label": "Example Targeted Watch",
+      "enabled": false,
+      "priorityTier": "watch",
+      "collection": "0x1111111111111111111111111111111111111111",
+      "tokenIds": ["1", "42", "1337"],
+      "traits": [{ "key": "Background", "value": "Blue" }],
+      "ownerWallets": ["0x2222222222222222222222222222222222222222"],
+      "filters": {
+        "priceBand": {
+          "targetBuyPrice": 0.5
+        },
+        "rarity": {
+          "maxTopPercentile": 5
+        },
+        "traitFloor": {
+          "trait": { "key": "Background", "value": "Blue" },
+          "maxPrice": 1
+        }
+      },
+      "muted": false,
+      "dedupeWindowMinutes": 60,
+      "rateLimitPerHour": 5
+    }
+  ]
+}
