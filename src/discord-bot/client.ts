@@ -19,8 +19,15 @@ import type { Alert, CollectionInfo, SaleInfo } from "../types/index.js";
 import type { BidLeadCandidate } from "../watchlist/candidate.js";
 import type { BidLeadMonitor } from "../watchlist/leadMonitor.js";
 import type { WatchlistMatch } from "../watchlist/evaluate.js";
+import { describeSettings } from "../config/runtime.js";
+import { buildPortfolioSnapshot, getCachedPortfolioAddress } from "../portfolio/portfolio.js";
+import { planResetGlobalSetting, planSetEntrySetting, planSetGlobalSetting, type PlanResult } from "../watchlist/configMutate.js";
 import { planAddEntry, planCreateLeadRule, planRemoveEntry, type LeadRuleCondition, type LeadRuleParams } from "../watchlist/mutate.js";
+import type { AllowlistConfig } from "../watchlist/schema.js";
 import { loadWatchlistConfig, saveWatchlistConfig } from "../watchlist/store.js";
+import type { WatchedItem } from "../watchlist/watchStore.js";
+import type { WhaleActivity } from "../watchlist/whaleStore.js";
+import type { RecapSummary } from "../watchlist/recap.js";
 import {
   routeCommand,
   type AddWatchlistOutcome,
@@ -30,7 +37,6 @@ import {
   type CreateLeadRuleOutcome,
   type PendingAddPreview,
   type RemoveWatchlistOutcome,
-  type WatchlistSubcommand,
 } from "./commandRouter.js";
 import { commandDefinitions } from "./commands.js";
 import {
@@ -38,7 +44,11 @@ import {
   buildAlertEmbed,
   buildBidLeadEmbed,
   buildListingStatusEmbed,
+  buildRecapEmbed,
   buildSaleEmbed,
+  buildWatchedDelistedEmbed,
+  buildWatchedSoldEmbed,
+  buildWhaleActivityEmbed,
   toDiscordEmbed,
   type EmbedContent,
   type StatusInfo,
@@ -54,6 +64,12 @@ export interface DiscordBotClient {
   notifyWatchedChange(candidate: BidLeadCandidate, previousPriceNative: number): Promise<void>;
   notifyWatchedSold(item: WatchedItem, sale: SaleInfo): Promise<void>;
   notifyWatchedDelisted(item: WatchedItem): Promise<void>;
+  /** A tracked wallet bought/sold/listed inside an allowlisted collection (Group 3.2). */
+  postWhaleActivity(activity: WhaleActivity): Promise<void>;
+  /** Twice-daily trend digest, with an optional locally-rendered chart attached. */
+  postTrendAlertWithChart(alert: Alert, chart: { label: string; png: Buffer } | undefined): Promise<void>;
+  /** Once-daily overnight recap, with up to a handful of charts attached. */
+  postRecap(summary: RecapSummary, charts: Array<{ label: string; png: Buffer }>): Promise<void>;
   /** Returns the posted message's ID (so BidLeadMonitor can anchor future thread recurrence/price-change updates to it), or undefined if nothing was posted. */
   postNewListing(alert: Alert): Promise<string | undefined>;
   postTrendAlert(alert: Alert): Promise<void>;
@@ -461,6 +477,28 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
     }
   }
 
+  /**
+   * Shared write path for every `/config` mutation: plan (validated) ->
+   * save watchlist.json -> reload the live monitor. Identical shape to the
+   * /watchlist add|remove flow, so a config change takes effect immediately
+   * without dropping the gateway connection.
+   */
+  function applyConfigPlan(plan: (cfg: AllowlistConfig) => PlanResult<unknown>, describe: (detail: unknown) => string): { ok: boolean; message: string } {
+    try {
+      const cfg = loadWatchlistConfig(config.WATCHLIST_CONFIG_PATH);
+      const result = plan(cfg);
+      if (!result.ok) return { ok: false, message: result.message };
+
+      saveWatchlistConfig(result.config, config.WATCHLIST_CONFIG_PATH);
+      // reload() re-applies the settings overrides process-wide AND
+      // reschedules the trend/recap digests if their times changed.
+      leadMonitor.reload();
+      return { ok: true, message: describe(result.detail) };
+    } catch (err) {
+      return { ok: false, message: `Failed to update watchlist.json: ${(err as Error).message}` };
+    }
+  }
+
   function getStatusInfo(): StatusInfo {
     return {
       dryRun: config.DRY_RUN,
@@ -475,6 +513,16 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
       lastTrendCheckAt: leadMonitor.getLastTrendCheckAt(),
       rateLimitHealth: openseaClient.getRateLimitHealth(),
       activitySummary: leadMonitor.getActivitySummary(),
+      watchedItemCount: leadMonitor.getWatchedItems().length,
+      whaleCount: leadMonitor.getWhales().length,
+      lastRecapAt: leadMonitor.getLastRecapAt(),
+      nextRecapAt: leadMonitor.getNextRecapTime(),
+      chartsEnabled: config.TREND_CHARTS_ENABLED,
+      // Read from the cache only — /status must never block on an ENS RPC
+      // round-trip. It populates after the first /portfolio (or startup
+      // pre-resolution in index.ts).
+      portfolioAddress: getCachedPortfolioAddress()?.address ?? null,
+      portfolioEnsName: getCachedPortfolioAddress()?.ensName ?? null,
     };
   }
 
@@ -491,6 +539,36 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
     removeWatchlistEntry,
     createLeadRule,
     getStatusInfo,
+
+    // --- Group 3 ---
+    listWatchedItems: () => leadMonitor.getWatchedItems(),
+    removeWatchedItem: (collectionId, tokenId) => leadMonitor.removeWatchedSubject(collectionId, tokenId),
+    addWhale: (address, label) => leadMonitor.addWhale(address, label),
+    removeWhale: (address) => leadMonitor.removeWhale(address),
+    listWhales: () => leadMonitor.getWhales(),
+    describeSettings: () => describeSettings(),
+    setGlobalSetting: (key, value) =>
+      applyConfigPlan(
+        (cfg) => planSetGlobalSetting(cfg, key, value),
+        (detail) => {
+          const d = detail as { key: string; value: unknown };
+          return `Set \`${d.key}\` to **${String(d.value)}** — in effect now, persisted to watchlist.json.`;
+        },
+      ),
+    resetGlobalSetting: (key) =>
+      applyConfigPlan(
+        (cfg) => planResetGlobalSetting(cfg, key),
+        (detail) => `Reset \`${(detail as { key: string }).key}\` — now using the .env value again.`,
+      ),
+    setEntrySetting: (collectionMatcher, key, value) =>
+      applyConfigPlan(
+        (cfg) => planSetEntrySetting(cfg, collectionMatcher, key, value),
+        (detail) => {
+          const d = detail as { label: string; key: string; value: unknown };
+          return `Set \`${d.key}\` to **${String(d.value)}** on **${d.label}**.`;
+        },
+      ),
+    getPortfolio: () => buildPortfolioSnapshot(),
   };
 
   async function getChannel(channelId: string): Promise<SendableChannels | null> {
@@ -513,6 +591,46 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
       await channel.send({ content, embeds: embed ? [toDiscordEmbed(embed)] : undefined });
     } catch (err) {
       console.warn(`[discord-bot] Failed to send to channel ${channelId}: ${(err as Error).message}`);
+    }
+  }
+
+  /** Filename-safe slug for a chart attachment — Discord's `attachment://` reference only matches on an exact, simple name. */
+  function chartFileName(label: string, index: number): string {
+    const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-+|-+$)/g, "").slice(0, 40) || "chart";
+    return `${slug}-${index}.png`;
+  }
+
+  /**
+   * Sends one or more embeds with locally-rendered PNG charts attached.
+   * Charts are referenced via `attachment://<name>`, which is what makes
+   * Discord render the image inline in the embed rather than as a separate
+   * file card below it.
+   */
+  async function sendEmbedsWithCharts(
+    channelId: string,
+    embeds: EmbedContent[],
+    charts: Array<{ label: string; png: Buffer }>,
+  ): Promise<void> {
+    const channel = await getChannel(channelId);
+    if (!channel) return;
+
+    const files = charts.map((c, i) => ({ attachment: c.png, name: chartFileName(c.label, i) }));
+    try {
+      await channel.send({
+        embeds: embeds.map((e) => toDiscordEmbed(e)),
+        files: files.length > 0 ? files : undefined,
+      });
+    } catch (err) {
+      console.warn(`[discord-bot] Failed to send charted message to channel ${channelId}: ${(err as Error).message}`);
+      // A rejected attachment (size, transient upload failure) shouldn't
+      // cost the operator the digest itself — retry text-only once.
+      if (files.length > 0) {
+        try {
+          await channel.send({ embeds: embeds.map((e) => toDiscordEmbed({ ...e, image: undefined })) });
+        } catch (retryErr) {
+          console.warn(`[discord-bot] Text-only retry also failed for channel ${channelId}: ${(retryErr as Error).message}`);
+        }
+      }
     }
   }
 
@@ -616,7 +734,7 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
 
     const invocation: CommandInvocation = {
       commandName: interaction.commandName as CommandName,
-      subcommand: (interaction.options.getSubcommand(false) as WatchlistSubcommand | null) ?? undefined,
+      subcommand: (interaction.options.getSubcommand(false) as CommandInvocation["subcommand"]) ?? undefined,
       collection: interaction.options.getString("collection") ?? undefined,
       hours: interaction.options.getInteger("hours") ?? undefined,
       condition: (interaction.options.getString("condition") as LeadRuleCondition | null) ?? undefined,
@@ -624,6 +742,11 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
       percentile: interaction.options.getNumber("percentile") ?? undefined,
       traitCategory: interaction.options.getString("trait_category") ?? undefined,
       traitValue: interaction.options.getString("trait_value") ?? undefined,
+      tokenId: interaction.options.getString("token_id") ?? undefined,
+      address: interaction.options.getString("address") ?? undefined,
+      label: interaction.options.getString("label") ?? undefined,
+      key: interaction.options.getString("key") ?? undefined,
+      value: interaction.options.getString("value") ?? undefined,
       userId: interaction.user.id,
       username: interaction.user.username,
     };
@@ -710,10 +833,62 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
     },
     async notifyWatchedChange(candidate, previousPriceNative) {
       if (!isAllowlisted(candidate.collectionId)) return;
+      const direction = candidate.priceNative < previousPriceNative ? "📉 Price DROP" : "📈 Price rise";
       await sendEmbed(
         config.DISCORD_BID_LEADS_CHANNEL_ID,
-        `👀 Watched update — ${candidate.collectionName} #${candidate.tokenId}: ${previousPriceNative} → ${candidate.priceNative} ${candidate.priceCurrency}.`,
+        `👀 ${direction} on a watched item — ${candidate.collectionName} #${candidate.tokenId}: ` +
+          `${previousPriceNative} → ${candidate.priceNative} ${candidate.priceCurrency}.`,
       );
+    },
+    async notifyWatchedSold(item, sale) {
+      if (!isAllowlisted(item.collectionId)) return;
+      const ethUsdRate = await openseaClient.getEthUsdRate();
+      await sendEmbed(config.DISCORD_BID_LEADS_CHANNEL_ID, undefined, buildWatchedSoldEmbed(item, sale, ethUsdRate));
+    },
+    async notifyWatchedDelisted(item) {
+      if (!isAllowlisted(item.collectionId)) return;
+      const ethUsdRate = await openseaClient.getEthUsdRate();
+      await sendEmbed(config.DISCORD_BID_LEADS_CHANNEL_ID, undefined, buildWatchedDelistedEmbed(item, ethUsdRate));
+    },
+    async postWhaleActivity(activity) {
+      // Defense in depth: BidLeadMonitor only ever scans allowlisted
+      // collections, but every emission path checks explicitly.
+      if (!isAllowlisted(activity.collectionId)) {
+        console.warn(`[discord-bot] Refusing to post whale activity for non-allowlisted collection ${activity.collectionId}.`);
+        return;
+      }
+      const channelId = config.DISCORD_WHALE_CHANNEL_ID || config.DISCORD_BID_LEADS_CHANNEL_ID;
+      await sendEmbed(channelId, undefined, buildWhaleActivityEmbed(activity));
+    },
+    async postTrendAlertWithChart(alert, chart) {
+      if (!isAllowlisted(alert.collectionId)) {
+        console.warn(`[discord-bot] Refusing to post trend alert for non-allowlisted collection ${alert.collectionId}.`);
+        return;
+      }
+
+      const embed = buildAlertEmbed(alert);
+      if (!chart) {
+        await sendEmbed(config.DISCORD_TREND_ALERTS_CHANNEL_ID, undefined, embed);
+        return;
+      }
+
+      // Point the embed's image at the attachment we're uploading alongside it.
+      const name = chartFileName(chart.label, 0);
+      await sendEmbedsWithCharts(config.DISCORD_TREND_ALERTS_CHANNEL_ID, [{ ...embed, image: `attachment://${name}` }], [chart]);
+    },
+    async postRecap(summary, charts) {
+      const channelId = config.DISCORD_RECAP_CHANNEL_ID || config.DISCORD_TREND_ALERTS_CHANNEL_ID;
+      const embed = buildRecapEmbed(summary);
+
+      if (charts.length === 0) {
+        await sendEmbed(channelId, undefined, embed);
+        return;
+      }
+
+      // The summary embed carries the first chart inline; the rest upload as
+      // additional attachments on the same message.
+      const firstName = chartFileName(charts[0]!.label, 0);
+      await sendEmbedsWithCharts(channelId, [{ ...embed, image: `attachment://${firstName}` }], charts);
     },
     async postNewListing(alert) {
       // Defense in depth: leadMonitor only ever produces this for allowlisted

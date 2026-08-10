@@ -34,15 +34,34 @@ a chain in this version.
 - **Discord bot**: an allowlist-only bid-lead pipeline — a gateway-connected
   bot posts candidate buy opportunities as rich embeds with ✅/❌/👀
   reactions, plus a slash-command interface (`/watchlist`, `/listings`,
-  `/floor`, `/offers`, `/status`, `/help`) for managing the allowlist and
-  querying OpenSea on demand; only one authorized Discord user can use any
-  of it (see [Discord bot](#discord-bot) below).
+  `/floor`, `/offers`, `/watching`, `/whale`, `/config`, `/portfolio`,
+  `/status`, `/help`) for managing the allowlist and querying OpenSea on
+  demand; only one authorized Discord user can use any of it (see
+  [Discord bot](#discord-bot) below).
+- **Watch follow-ups**: marking a lead 👀 adds it to a persisted watch set
+  that survives restarts and keeps generating alerts — price drop, sold,
+  likely delisted (see [Watching items](#watching-items-)).
+- **Whale tracking**: mark wallet addresses and get alerted when they buy,
+  sell, or list **inside your allowlisted collections** (see
+  [Whale tracking](#whale-tracking-)).
+- **Charts & daily recap**: the twice-daily trend digest carries a locally
+  rendered floor/volume chart, and a once-daily overnight recap summarizes
+  the past 24h across every watched collection (see
+  [Trend charts and the daily recap](#trend-charts-and-the-daily-recap-)).
+- **In-Discord config**: `/config` edits thresholds, quiet hours, mute, rule
+  values, and the USD toggle live — validated, persisted, no restart (see
+  [In-Discord configuration](#in-discord-configuration-)).
+- **Portfolio (read-only)**: resolves an ENS name to its public address and
+  reports holdings, floor value, and offers received. Holds no key, signs
+  nothing, cannot spend (see [Portfolio](#portfolio-read-only-)).
 
 ## Project layout
 
 ```
 src/
-  config/       env loading + zod validation (src/config/env.ts)
+  config/       env loading + zod validation (env.ts), plus runtime.ts — the
+                resolution point for tunables editable from both .env and
+                /config (watchlist.json overrides .env)
   opensea/      OpenSea API v2 client + address->slug resolver + mock data fallback
   orders/       dry-run order builder, order intake/validation,
                 disabled live-execution stub
@@ -50,18 +69,38 @@ src/
   notify/       discord webhook, SMTP email, console — dispatched together
   agent/        orchestrator: wires monitor -> notify, exposes order intake
   dashboard/    Express API server + SSE alert fan-out for the web dashboard
+  chart/        dependency-free PNG chart rendering: a minimal PNG encoder
+                (png.ts), a tiny software rasterizer with a bitmap font
+                (canvas.ts), and the floor/volume chart itself
+  eth/          keccak256 + ENS namehash/resolution over read-only eth_call
+  portfolio/    READ-ONLY holdings/floor-value/offers for a public address
   watchlist/    allowlist-only bid-lead config (schema/store), filter
                 evaluation, quiet-hours/dedupe/rate-limit, the poller that
-                turns fresh listings into candidate bid leads, and the pure
-                add/remove mutation logic behind /watchlist add|remove
+                turns fresh listings into candidate bid leads, the pure
+                add/remove/config mutation logic behind the slash commands,
+                and the persisted watch/whale/floor-history stores
   discord-bot/  discord.js gateway client, bid-lead embeds, the ✅/❌/👀
                 reaction router, and the slash-command router — all
                 unit-testable without a live connection
   index.ts      CLI entry point
 public/         static dashboard frontend (index.html, style.css, app.js)
-watchlist.json  allowlist-only bid-lead config — edit this to add/remove
-                what the Discord bot watches for
+watchlist.json  allowlist-only bid-lead config + global /config overrides —
+                edit this (or use /config) to change what the bot watches
 ```
+
+### Local state files (all gitignored)
+
+These are runtime state, written next to `watchlist.json`. Deleting any of
+them is safe — each one rebuilds itself, at the cost of re-baselining.
+
+| File | Holds |
+| --- | --- |
+| `.watchlist-seen-state.json` | Already-seen listing/sale IDs, so a restart never backfills |
+| `.watchlist-listing-anchors.json` | #new-listings message/thread anchors per token |
+| `.watchlist-watched-items.json` | The 👀 watch set (Group 3.1) |
+| `.watchlist-whales.json` | Tracked whale wallets (Group 3.2) |
+| `.watchlist-floor-history.json` | Floor/volume time series behind charts + recap (Group 3.3) |
+| `.bot.lock` / `.bot.pid` | Single-instance guard |
 
 ## Setup
 
@@ -727,6 +766,206 @@ invocation, so it doesn't leak watchlist entry names or live OpenSea data
 to other guild members who can technically type a slash command even
 though they can't run one.
 
+### Watching items 👀
+
+Marking a bid lead 👀 (the **Watch** button, or the reaction) adds that
+token to a **persisted** watch set — `.watchlist-watched-items.json`, via
+`src/watchlist/watchStore.ts`. This survives restarts, which is the whole
+point: the previous in-memory `Map` silently forgot everything you were
+watching every time the process bounced.
+
+Each poll tick, `BidLeadMonitor.checkWatchedSubjects` compares every watched
+token against that collection's fresh listings and sales:
+
+| Signal | Detected when | What happens |
+| --- | --- | --- |
+| **Price change / drop** | Still listed, but at a different price than last recorded | Posts a 📉/📈 update, records the new price, resets the missing-tick counter |
+| **Sold** | The token appears in this tick's sales | Posts a 💸 card showing the sale price vs. what you were watching it at, then **stops watching** (nothing left to watch) |
+| **Likely delisted** | Absent from both listings *and* sales for 3 consecutive ticks | Posts a 🚪 notice, then stops watching |
+
+Commands:
+
+```
+/watching list                                   # everything currently watched
+/watching remove collection:<...> token_id:<...> # stop watching one item
+```
+
+`/watching list` prints the exact `remove` line for each item, so you can
+copy it rather than reconstructing the address by hand.
+
+**Caveat, stated in the alert itself:** "likely delisted" is best-effort.
+The listings/sales we poll are capped-size recent-activity windows, not a
+full live snapshot, so a quiet collection could in principle miss a tick
+without the token actually being delisted. It's a hint, not a fact.
+
+### Whale tracking 🐋
+
+Mark wallet addresses and get alerted when they act **inside your
+allowlisted collections**:
+
+```
+/whale add address:0xabc… label:punk whale
+/whale remove address:0xabc…
+/whale list
+```
+
+Tracked wallets persist to `.watchlist-whales.json`. Alerts fire on three
+actions, all derived from data the poll already has in hand:
+
+| Action | Source |
+| --- | --- |
+| **BOUGHT** | The wallet is the `buyer` on a sale in this tick |
+| **SOLD** | The wallet is the `seller` on a sale in this tick |
+| **LISTED** | The wallet is the `seller` on a new listing in this tick |
+
+Three properties worth being explicit about:
+
+- **Strictly allowlist-scoped.** `checkWhaleActivity` is only ever called
+  from `pollCollection`, over listings/sales fetched for a collection that
+  is on the allowlist *by construction*. A tracked wallet's activity in a
+  collection you don't watch is structurally invisible — not filtered out
+  after the fact.
+- **Zero additional API calls.** It reads the same listings/sales arrays the
+  tick already fetched, so turning whale tracking on costs nothing against
+  the OpenSea request budget.
+- **Deduped and throttled.** Routed through the same per-entry `LeadLimiter`
+  as bid leads, under its own `whale:` key namespace so it can never suppress
+  (or be suppressed by) a regular lead, sale, or offer for the same token.
+  The dedupe key includes the specific event ID, so a genuinely new event
+  always gets through while a re-observed one never double-posts. Entry mute
+  and quiet hours apply.
+
+Posts to `DISCORD_WHALE_CHANNEL_ID` if set, otherwise the bid-leads channel.
+
+### Trend charts and the daily recap 📊
+
+**Charts.** Every poll tick records the floor/volume reading it already
+fetched into `.watchlist-floor-history.json`
+(`src/watchlist/historyStore.ts`, ~30 days retained at the default hourly
+cadence). The twice-daily trend digest then attaches a floor/volume chart
+for the moving collection, and the daily recap attaches up to 5.
+
+Charts are rendered **entirely in-process** by `src/chart/`:
+
+- `png.ts` — a minimal PNG encoder (IHDR/IDAT/IEND + CRC32, compressed with
+  Node's built-in `zlib`).
+- `canvas.ts` — a small software rasterizer (rects, lines, points, and text
+  via an embedded 5×7 bitmap font).
+- `floorChart.ts` — the chart itself: floor line colored by net direction,
+  volume bars, gridlines, axis labels, and a legend.
+
+Why hand-rolled rather than a chart library: every JS canvas/SVG-rasterizer
+option (`canvas`, `sharp`, `resvg`) pulls a **native** binary dependency —
+a compile step, platform-specific binaries, and a real chance of a broken
+install on Windows. PNG's container format is simple enough that encoding it
+directly is smaller and more reliable. It also means nothing about your
+watchlist is sent to an external image service. (SVG isn't an option:
+Discord doesn't render SVG attachments inline.)
+
+A collection with fewer than 2 samples yields **no chart** rather than a
+misleading one-point "trend" — the digest posts text-only instead. Set
+`TREND_CHARTS_ENABLED=false` to disable charts entirely.
+
+**Daily recap.** At `DAILY_RECAP_TIME` (default `07:00` local) the bot posts
+a 🌅 overnight recap covering the past 24h across *every* watched
+collection: top gainer/loser, plus per-collection floor change, new
+listings, sales, sale volume, and bid leads. This is deliberately distinct
+from the trend digest — the digest reports individual floor *moves* that
+crossed a threshold, while the recap summarizes the window whether or not
+anything moved.
+
+Recap counters reset each time a recap posts, so consecutive recaps tile the
+calendar with no gap or double-counting. A collection without at least two
+samples in the window reports its change as `—` rather than a fabricated
+`0%`: "not enough history to say" and "it didn't move" are different
+statements.
+
+Posts to `DISCORD_RECAP_CHANNEL_ID` if set, otherwise the trend-alerts
+channel.
+
+### In-Discord configuration ⚙️
+
+`/config` edits tunables live, with no restart and without dropping the
+gateway connection:
+
+```
+/config show                                            # every tunable + where its value comes from
+/config set key:floor_move_threshold_percent value:8
+/config reset key:floor_move_threshold_percent          # fall back to the .env value
+/config entry collection:"Super Punk World" key:muted value:true
+```
+
+**Global tunables** (`/config set`): `show_usd`,
+`floor_move_threshold_percent`, `new_listing_max_price`,
+`offer_above_collection_percent`, `trend_alert_times`, `daily_recap_time`.
+
+**Per-collection tunables** (`/config entry`): `muted`, `enabled`,
+`target_buy_price`, `max_floor`, `min_percent_from_floor`,
+`max_percent_from_floor`, `dedupe_window_minutes`, `rate_limit_per_hour`,
+`quiet_hours_start`, `quiet_hours_end`, `quiet_hours_timezone`,
+`priority_tier`.
+
+How it works:
+
+- Global overrides live in a `settings` block in `watchlist.json`. Every
+  read of a tunable goes through `src/config/runtime.ts`, whose precedence
+  is always **watchlist.json override → .env value**. An absent override
+  falls straight back to `.env`, so `.env` stays the source of truth for
+  anything you haven't deliberately changed from Discord — and
+  `/config reset` genuinely restores it.
+- Every value is parsed and then validated against the Zod schema
+  (`src/watchlist/configMutate.ts`) **before** anything is written, so an
+  out-of-range threshold, a malformed `25:00` time, or an unrecognized IANA
+  timezone is rejected with a reason rather than corrupting the config.
+  The mutation planners are pure and unit-tested.
+- Writing triggers the same save-then-reload flow as `/watchlist add`, which
+  re-applies overrides process-wide and **reschedules the trend/recap
+  timers** if you changed their times.
+- Authorized-user-only, like every other command.
+
+### Portfolio (read-only) 📦
+
+`/portfolio` resolves `PORTFOLIO_ENS_NAME` (default `neworc.eth`) to its
+public address and reports holdings grouped by collection, each collection's
+floor and estimated value, and a bounded sample of offers received.
+
+> **This feature is strictly, structurally read-only.** The bot holds **no
+> private key or seed phrase** — there is no configuration option to supply
+> one. It performs **no wallet connection** and **signs nothing** (no
+> `personal_sign`, no `eth_signTypedData`, no transaction signing). It
+> **cannot** buy, sell, transfer, list, bid, or approve. It issues only HTTP
+> GETs to OpenSea plus read-only `eth_call`s for ENS resolution — neither of
+> which can mutate chain state. Observing a public address confers no control
+> over it, exactly as with a block explorer.
+>
+> This is asserted in the code (`src/portfolio/portfolio.ts`,
+> `src/eth/ens.ts`), restated in the `/portfolio` embed footer where you
+> actually use it, and in the `#server-guide` safety invariants.
+
+Anything that would actually place an order still goes through the existing
+dry-run intake (`src/orders/`), itself gated by `DRY_RUN`, with live
+execution unimplemented.
+
+**ENS resolution** is done directly rather than via a dependency:
+`src/eth/keccak.ts` implements Keccak-256 (Node's `crypto` only offers NIST
+SHA3-256 — same permutation, *different padding*, so using it would silently
+produce wrong namehashes and resolve to the wrong address), and
+`src/eth/ens.ts` does `Registry.resolver(namehash)` → `Resolver.addr(...)`.
+Both are verified against published test vectors, including
+`namehash("eth")` and the EIP-137 `vitalik.eth` example.
+
+Resolution is cached for the process lifetime and pre-warmed at startup so
+`/status` can display the address without blocking. Set `PORTFOLIO_ADDRESS`
+to skip ENS entirely. Portfolio lookups need a live `OPENSEA_API_KEY` — with
+none configured the bot reports "no holdings" rather than inventing a
+portfolio from mock data.
+
+Bounded by design: holdings are capped at 200 items and offers are sampled
+on at most 12 tokens (largest holdings first), so `/portfolio` can't blow
+the OpenSea request budget. The embed states what was sampled and whether
+any collection's floor was unreadable, so a partial figure is never mistaken
+for a complete one.
+
 ### Guided lead rules + traits
 
 `/watchlist create-rule` builds a **single-condition** allowlist entry —
@@ -1092,4 +1331,15 @@ See `.env.example` for the full list with inline documentation:
 `TREND_ALERT_TIMES`, `OFFER_ABOVE_COLLECTION_THRESHOLD_PERCENT`,
 `SALES_LOOKBACK_MINUTES`, `SHOW_USD`, `OPENSEA_REQUESTS_PER_MINUTE`, `WATCHLIST_CONFIG_PATH`.
 
-`.env` is gitignored — never commit it.
+Added for Group 3: `DISCORD_WHALE_CHANNEL_ID`, `DISCORD_RECAP_CHANNEL_ID`,
+`DAILY_RECAP_TIME`, `TREND_CHARTS_ENABLED`, `PORTFOLIO_ENS_NAME`,
+`PORTFOLIO_ADDRESS`, `ETH_RPC_URLS`.
+
+Six of these can also be changed live from Discord with `/config set`, which
+persists an override into `watchlist.json`; the `.env` value remains the
+fallback and `/config reset` restores it. See
+[In-Discord configuration](#in-discord-configuration-).
+
+`.env` is gitignored — never commit it. **Never put a private key or seed
+phrase in it either**: nothing in this project needs one, and no feature —
+including the read-only portfolio view — will ever ask for one.

@@ -2,9 +2,13 @@ import { EmbedBuilder } from "discord.js";
 import { formatPriceWithUsd, type ResolvedCollection } from "../opensea/client.js";
 import type { RateLimitHealth } from "../opensea/requestScheduler.js";
 import type { Alert, CollectionInfo, CollectionOfferInfo, DryRunResult, ListingInfo, SaleInfo } from "../types/index.js";
+import type { PortfolioSnapshot } from "../portfolio/portfolio.js";
 import type { BidLeadCandidate } from "../watchlist/candidate.js";
 import type { WatchlistMatch } from "../watchlist/evaluate.js";
+import type { RecapCollectionLine, RecapSummary } from "../watchlist/recap.js";
 import type { AllowlistEntry } from "../watchlist/schema.js";
+import type { WatchedItem } from "../watchlist/watchStore.js";
+import type { WhaleActivity, WhaleWallet } from "../watchlist/whaleStore.js";
 
 /**
  * Framework-agnostic embed content — built and unit-testable without
@@ -94,6 +98,15 @@ export interface StatusInfo {
   rateLimitHealth: RateLimitHealth;
   /** Per-collection activity since the process started — resets on restart, same as everything else in-memory here. */
   activitySummary: Array<{ label: string; listings: number; sales: number; leads: number }>;
+  /** Group 3 surfaces. */
+  watchedItemCount: number;
+  whaleCount: number;
+  lastRecapAt: string | null;
+  nextRecapAt: Date | null;
+  chartsEnabled: boolean;
+  /** Resolved read-only portfolio address, or null when unresolved/unconfigured. */
+  portfolioAddress: string | null;
+  portfolioEnsName: string | null;
 }
 
 /** "2h 14m", "45m", "38s" — never a raw seconds count. */
@@ -421,7 +434,22 @@ export function buildStatusEmbed(status: StatusInfo): EmbedContent {
     { name: "Trend digest times", value: status.trendAlertTimes, inline: true },
     {
       name: "Next trend digest",
-      value: status.nextTrendCheckAt ? status.nextTrendCheckAt.toLocaleString() : "not scheduled",
+      value: `${status.nextTrendCheckAt ? status.nextTrendCheckAt.toLocaleString() : "not scheduled"}${status.chartsEnabled ? " (with chart)" : ""}`,
+      inline: false,
+    },
+    { name: "👀 Watching", value: `${status.watchedItemCount} item(s)`, inline: true },
+    { name: "🐋 Tracked wallets", value: `${status.whaleCount}`, inline: true },
+    { name: "Last recap", value: relativeTimeOrNever(status.lastRecapAt), inline: true },
+    {
+      name: "Next daily recap",
+      value: status.nextRecapAt ? status.nextRecapAt.toLocaleString() : "not scheduled",
+      inline: false,
+    },
+    {
+      name: "📦 Portfolio (read-only)",
+      value: status.portfolioAddress
+        ? `${status.portfolioEnsName ? `${status.portfolioEnsName} → ` : ""}\`${status.portfolioAddress}\`\nPublic address only — no key, cannot sign or spend.`
+        : "not resolved (set PORTFOLIO_ENS_NAME or PORTFOLIO_ADDRESS)",
       inline: false,
     },
     {
@@ -469,10 +497,42 @@ export function buildHelpEmbed(): EmbedContent {
       { name: "/floor collection:<...>", value: "Current floor price and stats.", inline: false },
       { name: "/offers collection:<...>", value: "Current top offers/bids.", inline: false },
       {
+        name: "/watching list · /watching remove collection: token_id:",
+        value:
+          "Items you've marked 👀. Each one keeps generating follow-up alerts — **price drop/change**, **sold**, and **likely delisted** — and the list survives restarts.",
+        inline: false,
+      },
+      {
+        name: "/whale add address:<0x…> label:<...> · /whale remove · /whale list",
+        value:
+          "Track wallets. Alerts fire when a tracked wallet **buys, sells, or lists inside an allowlisted collection** — activity anywhere else is never reported. Deduped and rate-limited like every other signal.",
+        inline: false,
+      },
+      {
+        name: "/config show · /config set key: value: · /config reset key: · /config entry collection: key: value:",
+        value:
+          "Edit tunables live from Discord — thresholds, quiet hours, mute, rule values, USD toggle. Changes are validated, persisted to watchlist.json, and take effect immediately. `/config reset` drops an override back to the .env value.",
+        inline: false,
+      },
+      {
+        name: "/portfolio",
+        value:
+          "**READ-ONLY** holdings for the configured public address (resolved from ENS), their floor value, and offers received. " +
+          "The bot holds no private key, makes no wallet connection, and cannot sign or spend anything.",
+        inline: false,
+      },
+      {
         name: "/status",
         value:
-          "Full dashboard: mode, data source, uptime, last poll/trend-check, OpenSea rate-limit health, next trend digest, " +
-          "and per-collection activity counts since the bot started.",
+          "Full dashboard: mode, data source, uptime, last poll/trend-check, OpenSea rate-limit health, next trend digest and daily recap, " +
+          "watched-item and tracked-wallet counts, the read-only portfolio address, and per-collection activity counts since the bot started.",
+        inline: false,
+      },
+      {
+        name: "Digests",
+        value:
+          "**Trend digest** (twice daily) posts floor moves past the threshold, each with a locally-rendered floor/volume chart. " +
+          "**Overnight recap** (once daily) summarizes the past 24h across every watched collection.",
         inline: false,
       },
       {
@@ -485,6 +545,244 @@ export function buildHelpEmbed(): EmbedContent {
       { name: "/help", value: "This message.", inline: false },
     ],
     footer: "Only the authorized user can use these commands. All replies are private (ephemeral).",
+  };
+}
+
+// --- Group 3: watch flow, whales, recap, config, portfolio ---
+
+/** 👀 A watched token's price moved, it sold, or it looks delisted. */
+export function buildWatchedSoldEmbed(item: WatchedItem, sale: SaleInfo, ethUsdRate?: number): EmbedContent {
+  const priceText = formatPriceWithUsd(sale.priceNative, sale.priceCurrency, { knownUsd: sale.priceUsd, ethUsdRate });
+  const watchedAtText = formatPriceWithUsd(item.lastKnownPriceNative, item.lastKnownPriceCurrency, { ethUsdRate });
+  const delta = sale.priceNative - item.lastKnownPriceNative;
+  const deltaText =
+    item.lastKnownPriceNative > 0
+      ? `${delta >= 0 ? "▲" : "▼"} ${Math.abs((delta / item.lastKnownPriceNative) * 100).toFixed(1)}% vs. when you started watching`
+      : "—";
+
+  return {
+    title: `💸 Watched item SOLD — ${item.collectionName} #${item.tokenId}`,
+    description: `You were watching this at ${watchedAtText}. It just sold for **${priceText}**.`,
+    color: COLOR_WARN,
+    fields: [
+      { name: "Sold for", value: priceText, inline: true },
+      { name: "You watched at", value: watchedAtText, inline: true },
+      { name: "Change", value: deltaText, inline: true },
+      { name: "Buyer", value: shortAddress(sale.buyer), inline: true },
+      { name: "Seller", value: shortAddress(sale.seller), inline: true },
+      { name: "Links", value: buildQuickLinks(item.collectionId, item.tokenId), inline: false },
+    ],
+    footer: withUsdFootnote("No longer watching — it's gone.", ethUsdRate !== undefined || sale.priceUsd !== undefined),
+    image: sale.imageUrl,
+    timestamp: sale.createdAt,
+  };
+}
+
+export function buildWatchedDelistedEmbed(item: WatchedItem, ethUsdRate?: number): EmbedContent {
+  return {
+    title: `🚪 Watched item likely DELISTED — ${item.collectionName} #${item.tokenId}`,
+    description:
+      `It hasn't appeared in recent listings or sales for several consecutive polls, so it looks like the listing was pulled. ` +
+      `This is a best-effort signal — the data we poll is a capped recent-activity window, not a full live snapshot, so treat it as a hint rather than a fact.`,
+    color: COLOR_NEUTRAL,
+    fields: [
+      { name: "Last known price", value: formatPriceWithUsd(item.lastKnownPriceNative, item.lastKnownPriceCurrency, { ethUsdRate }), inline: true },
+      { name: "Watched since", value: `<t:${Math.floor(new Date(item.addedAt).getTime() / 1000)}:R>`, inline: true },
+      { name: "Links", value: buildQuickLinks(item.collectionId, item.tokenId), inline: false },
+    ],
+    footer: withUsdFootnote("No longer watching.", ethUsdRate !== undefined),
+  };
+}
+
+/** `/watching list` */
+export function buildWatchingEmbed(items: WatchedItem[], ethUsdRate?: number): EmbedContent {
+  if (items.length === 0) {
+    return {
+      title: "Watching",
+      description: "Nothing is being watched. React 👀 (or press **Watch**) on a bid-lead card to start watching an item.",
+      color: COLOR_NEUTRAL,
+      fields: [],
+    };
+  }
+
+  const fields: EmbedFieldContent[] = items.slice(0, 25).map((item) => ({
+    name: `${item.collectionName} #${item.tokenId}`,
+    value:
+      `${formatPriceWithUsd(item.lastKnownPriceNative, item.lastKnownPriceCurrency, { ethUsdRate })} · ` +
+      `since <t:${Math.floor(new Date(item.addedAt).getTime() / 1000)}:R>\n` +
+      `\`/watching remove collection:${item.collectionId} token_id:${item.tokenId}\``,
+    inline: false,
+  }));
+
+  return {
+    title: `👀 Watching (${items.length})`,
+    description: "Follow-up alerts fire on price change, sale, or likely delisting.",
+    color: COLOR_WATCHING,
+    fields,
+    footer: withUsdFootnote(items.length > 25 ? `Showing 25 of ${items.length}` : undefined, ethUsdRate !== undefined),
+  };
+}
+
+/** A marked wallet bought/sold/listed inside an allowlisted collection. */
+export function buildWhaleActivityEmbed(activity: WhaleActivity): EmbedContent {
+  const verb = activity.action === "bought" ? "BOUGHT" : activity.action === "sold" ? "SOLD" : "LISTED";
+  const emoji = activity.action === "bought" ? "🐋🟢" : activity.action === "sold" ? "🐋🔴" : "🐋🏷️";
+  const priceText = formatPriceWithUsd(activity.priceNative, activity.priceCurrency, { ethUsdRate: activity.ethUsdRate });
+
+  const fields: EmbedFieldContent[] = [
+    { name: "Wallet", value: `[${activity.wallet.label}](https://etherscan.io/address/${activity.wallet.address})`, inline: true },
+    { name: "Action", value: verb, inline: true },
+    { name: "Price", value: priceText, inline: true },
+  ];
+  if (activity.counterparty) fields.push({ name: "Counterparty", value: shortAddress(activity.counterparty), inline: true });
+
+  const links = [buildQuickLinks(activity.collectionId, activity.tokenId, activity.wallet.address)];
+  if (activity.transactionHash) links.push(`[Etherscan: tx](https://etherscan.io/tx/${activity.transactionHash})`);
+  fields.push({ name: "Links", value: links.join(" · "), inline: false });
+
+  return {
+    title: `${emoji} Whale ${verb} — ${activity.collectionName} #${activity.tokenId}`,
+    description: `**${activity.wallet.label}** ${activity.action} this for ${priceText}.`,
+    color: activity.action === "bought" ? COLOR_ACCEPT : activity.action === "sold" ? COLOR_WARN : COLOR_LEAD,
+    fields,
+    footer: withUsdFootnote("Tracked wallet · allowlisted collections only", activity.ethUsdRate !== undefined),
+    image: activity.imageUrl,
+    timestamp: activity.timestamp,
+  };
+}
+
+/** `/whale list` */
+export function buildWhaleListEmbed(wallets: WhaleWallet[]): EmbedContent {
+  if (wallets.length === 0) {
+    return {
+      title: "🐋 Tracked wallets",
+      description: "No wallets are being tracked. Add one with `/whale add address:0x… label:…`.",
+      color: COLOR_NEUTRAL,
+      fields: [],
+    };
+  }
+
+  return {
+    title: `🐋 Tracked wallets (${wallets.length})`,
+    description: "Alerts fire when any of these buy, sell, or list **inside an allowlisted collection** — activity elsewhere is never reported.",
+    color: COLOR_INFO,
+    fields: wallets.slice(0, 25).map((w) => ({
+      name: w.label,
+      value: `[\`${w.address}\`](https://etherscan.io/address/${w.address})\nsince <t:${Math.floor(new Date(w.addedAt).getTime() / 1000)}:R>`,
+      inline: false,
+    })),
+    footer: wallets.length > 25 ? `Showing 25 of ${wallets.length}` : undefined,
+  };
+}
+
+/** The once-daily overnight recap. */
+export function buildRecapEmbed(summary: RecapSummary): EmbedContent {
+  const changeText = (line: RecapCollectionLine): string => {
+    if (line.changePct === null) return "floor —"; // not enough history yet, which is different from "no change"
+    const arrow = line.changePct > 0 ? "▲" : line.changePct < 0 ? "▼" : "▬";
+    return `floor ${arrow} ${Math.abs(line.changePct).toFixed(1)}%`;
+  };
+
+  const fields: EmbedFieldContent[] = summary.lines.slice(0, 20).map((line) => ({
+    name: line.label,
+    value:
+      `${changeText(line)} · now ${line.floorNow !== null ? formatPriceWithUsd(line.floorNow, line.currency, { ethUsdRate: summary.ethUsdRate }) : "unknown"}\n` +
+      `${line.listings} listing${line.listings === 1 ? "" : "s"} · ${line.sales} sale${line.sales === 1 ? "" : "s"} · ${line.leads} lead${line.leads === 1 ? "" : "s"}` +
+      (line.salesVolumeNative > 0 ? ` · ${line.salesVolumeNative} ${line.currency} volume` : ""),
+    inline: false,
+  }));
+
+  const headline: string[] = [];
+  if (summary.topGainer) headline.push(`📈 **${summary.topGainer.label}** +${summary.topGainer.changePct!.toFixed(1)}%`);
+  if (summary.topLoser) headline.push(`📉 **${summary.topLoser.label}** ${summary.topLoser.changePct!.toFixed(1)}%`);
+
+  return {
+    title: `🌅 Overnight recap — past ${summary.windowHours}h`,
+    description:
+      (headline.length > 0 ? `${headline.join(" · ")}\n\n` : "") +
+      `Across ${summary.lines.length} watched collection${summary.lines.length === 1 ? "" : "s"}: ` +
+      `**${summary.totals.listings}** new listing${summary.totals.listings === 1 ? "" : "s"}, ` +
+      `**${summary.totals.sales}** sale${summary.totals.sales === 1 ? "" : "s"}, ` +
+      `**${summary.totals.leads}** bid lead${summary.totals.leads === 1 ? "" : "s"}.`,
+    color: COLOR_LEAD,
+    fields,
+    footer: withUsdFootnote(
+      summary.lines.length > 20 ? `Showing 20 of ${summary.lines.length} collections` : undefined,
+      summary.ethUsdRate !== undefined,
+    ),
+    timestamp: summary.generatedAt,
+  };
+}
+
+/** `/config show` */
+export function buildConfigEmbed(settings: Array<{ key: string; value: string; source: "discord" | "env" }>): EmbedContent {
+  return {
+    title: "⚙️ Configuration",
+    description:
+      "Global tunables. `discord` = overridden via `/config set` (persisted in watchlist.json); `env` = using the .env value.\n" +
+      "Use `/config reset key:<name>` to drop an override and fall back to .env.",
+    color: COLOR_INFO,
+    fields: settings.map((s) => ({
+      name: s.key,
+      value: `**${s.value}** · from \`${s.source}\``,
+      inline: true,
+    })),
+    footer: "Per-collection tunables: /config entry collection:<...> key:<...> value:<...>",
+  };
+}
+
+/**
+ * `/portfolio` — READ-ONLY. Every figure here is derived from public data
+ * about a public address; the bot holds no key and cannot transact. That's
+ * stated in the footer so it's visible at the point of use, not just in the
+ * docs.
+ */
+export function buildPortfolioEmbed(snapshot: PortfolioSnapshot): EmbedContent {
+  if (snapshot.holdings.length === 0) {
+    return {
+      title: `📦 Portfolio — ${snapshot.ensName ?? shortAddress(snapshot.address)}`,
+      description:
+        `No NFT holdings found for \`${snapshot.address}\`.\n` +
+        "If you expected holdings here, note that portfolio lookups need a live `OPENSEA_API_KEY` — the bot will not fabricate a portfolio from mock data.",
+      color: COLOR_NEUTRAL,
+      fields: [],
+      footer: "READ-ONLY · public address · no private key, no wallet connection, cannot sign or spend.",
+    };
+  }
+
+  const fields: EmbedFieldContent[] = snapshot.holdings.slice(0, 20).map((h) => {
+    const value =
+      h.estimatedValueNative !== null
+        ? `${h.count} item${h.count === 1 ? "" : "s"} × ${formatPriceWithUsd(h.floorNative!, h.floorCurrency, { ethUsdRate: snapshot.ethUsdRate })} = **${formatPriceWithUsd(h.estimatedValueNative, h.floorCurrency, { ethUsdRate: snapshot.ethUsdRate })}**`
+        : `${h.count} item${h.count === 1 ? "" : "s"} · floor unavailable`;
+    const offer =
+      h.topOfferNative !== undefined
+        ? `\ntop offer received: ${formatPriceWithUsd(h.topOfferNative, h.topOfferCurrency ?? "ETH", { ethUsdRate: snapshot.ethUsdRate })} (on #${h.topOfferTokenId})`
+        : "";
+    return { name: h.collectionName, value: `${value}${offer}`, inline: false };
+  });
+
+  const caveats: string[] = [];
+  if (snapshot.collectionsMissingFloor > 0) {
+    caveats.push(`${snapshot.collectionsMissingFloor} collection(s) had no readable floor, so the total is an understatement`);
+  }
+  if (snapshot.truncated) caveats.push("holdings were truncated at the fetch cap");
+  caveats.push(`offers sampled on ${snapshot.offersSampled} token(s), not all`);
+
+  return {
+    title: `📦 Portfolio — ${snapshot.ensName ?? shortAddress(snapshot.address)}`,
+    description:
+      `\`${snapshot.address}\`\n` +
+      `**${snapshot.totalItems}** item${snapshot.totalItems === 1 ? "" : "s"} across **${snapshot.holdings.length}** collection${snapshot.holdings.length === 1 ? "" : "s"} · ` +
+      `estimated floor value **${formatPriceWithUsd(snapshot.estimatedTotalNative, "ETH", { ethUsdRate: snapshot.ethUsdRate })}**\n` +
+      `_${caveats.join("; ")}._`,
+    color: COLOR_LEAD,
+    fields,
+    footer: withUsdFootnote(
+      "READ-ONLY · public address · no private key, no wallet connection, cannot sign or spend.",
+      snapshot.ethUsdRate !== undefined,
+    ),
+    timestamp: snapshot.generatedAt,
   };
 }
 

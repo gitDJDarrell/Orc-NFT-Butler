@@ -413,6 +413,13 @@ function makeStatus(overrides: Partial<StatusInfo> = {}): StatusInfo {
     lastTrendCheckAt: null,
     rateLimitHealth: { requestsInLastMinute: 12, budgetPerMinute: 50, queueLength: 0, recent429Count: 0 },
     activitySummary: [],
+    watchedItemCount: 0,
+    whaleCount: 0,
+    lastRecapAt: null,
+    nextRecapAt: new Date(),
+    chartsEnabled: true,
+    portfolioAddress: null,
+    portfolioEnsName: null,
     ...overrides,
   };
 }

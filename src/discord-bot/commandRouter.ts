@@ -1,26 +1,42 @@
 import type { ResolvedCollection } from "../opensea/client.js";
+import type { PortfolioSnapshot } from "../portfolio/portfolio.js";
 import type { CollectionInfo, CollectionOfferInfo, ListingInfo } from "../types/index.js";
+import {
+  ENTRY_SETTING_KEYS,
+  GLOBAL_SETTING_KEYS,
+  type EntrySettingKey,
+  type GlobalSettingKey,
+} from "../watchlist/configMutate.js";
 import type { LeadRuleCondition, LeadRuleParams } from "../watchlist/mutate.js";
 import { findWatchlistNameMatch, suggestClosestWatchlistEntry } from "../watchlist/resolveInput.js";
 import type { AllowlistEntry } from "../watchlist/schema.js";
+import type { WatchedItem } from "../watchlist/watchStore.js";
+import type { WhaleWallet } from "../watchlist/whaleStore.js";
 import {
   buildAddPreviewEmbed,
+  buildConfigEmbed,
   buildFloorEmbed,
   buildHelpEmbed,
   buildListingsEmbed,
   buildOffersEmbed,
+  buildPortfolioEmbed,
   buildStatusEmbed,
+  buildWatchingEmbed,
   buildWatchlistEmbed,
+  buildWhaleListEmbed,
   type EmbedContent,
   type StatusInfo,
 } from "./embeds.js";
 
-export type CommandName = "watchlist" | "listings" | "floor" | "offers" | "status" | "help";
+export type CommandName = "watchlist" | "listings" | "floor" | "offers" | "status" | "help" | "watching" | "whale" | "config" | "portfolio";
 export type WatchlistSubcommand = "add" | "remove" | "list" | "create-rule";
+export type WatchingSubcommand = "list" | "remove";
+export type WhaleSubcommand = "add" | "remove" | "list";
+export type ConfigSubcommand = "show" | "set" | "reset" | "entry";
 
 export interface CommandInvocation {
   commandName: CommandName;
-  subcommand?: WatchlistSubcommand;
+  subcommand?: WatchlistSubcommand | WatchingSubcommand | WhaleSubcommand | ConfigSubcommand;
   collection?: string;
   hours?: number;
   /** create-rule only, below */
@@ -29,6 +45,14 @@ export interface CommandInvocation {
   percentile?: number;
   traitCategory?: string;
   traitValue?: string;
+  /** /watching remove */
+  tokenId?: string;
+  /** /whale add|remove */
+  address?: string;
+  label?: string;
+  /** /config set|reset|entry */
+  key?: string;
+  value?: string;
   userId: string;
   username: string;
 }
@@ -86,6 +110,23 @@ export interface CommandRouterDeps {
   removeWatchlistEntry: (input: string, resolvedAddress: string | null) => RemoveWatchlistOutcome;
   createLeadRule: (resolved: ResolvedCollection, params: LeadRuleParams) => CreateLeadRuleOutcome;
   getStatusInfo: () => StatusInfo;
+
+  // --- Group 3 ---
+  /** Every item currently marked 👀 (persisted — see WatchStore). */
+  listWatchedItems: () => WatchedItem[];
+  /** Returns false when the token wasn't being watched. */
+  removeWatchedItem: (collectionId: string, tokenId: string) => boolean;
+  addWhale: (address: string, label?: string) => { ok: boolean; message: string };
+  removeWhale: (address: string) => { ok: boolean; message: string };
+  listWhales: () => WhaleWallet[];
+  /** Current global tunables + whether each comes from Discord or .env. */
+  describeSettings: () => Array<{ key: string; value: string; source: "discord" | "env" }>;
+  /** Applies a validated `/config` mutation: writes watchlist.json and reloads the live monitor. */
+  setGlobalSetting: (key: GlobalSettingKey, value: string) => { ok: boolean; message: string };
+  resetGlobalSetting: (key: GlobalSettingKey) => { ok: boolean; message: string };
+  setEntrySetting: (collectionMatcher: string, key: EntrySettingKey, value: string) => { ok: boolean; message: string };
+  /** READ-ONLY portfolio snapshot; null when no address could be resolved. */
+  getPortfolio: () => Promise<PortfolioSnapshot | null>;
 }
 
 const DEFAULT_LISTINGS_HOURS = 24;
@@ -112,6 +153,14 @@ export async function routeCommand(deps: CommandRouterDeps, invocation: CommandI
         return await handleFloor(deps, invocation);
       case "offers":
         return await handleOffers(deps, invocation);
+      case "watching":
+        return await handleWatching(deps, invocation);
+      case "whale":
+        return handleWhale(deps, invocation);
+      case "config":
+        return await handleConfig(deps, invocation);
+      case "portfolio":
+        return await handlePortfolio(deps);
       case "status":
         return { embed: buildStatusEmbed(deps.getStatusInfo()), ephemeral: true };
       case "help":
@@ -238,6 +287,150 @@ async function handleCreateRule(deps: CommandRouterDeps, invocation: CommandInvo
   }
 
   return { content: `✅ Created lead rule: **${outcome.entry!.label}**`, ephemeral: true };
+}
+
+// --- Group 3 handlers ---
+
+/**
+ * `/watching list|remove`. Removal resolves the collection the same way
+ * every other command does, but falls back to matching the raw input
+ * against what's actually being watched — so the exact `\`/watching remove
+ * collection:0x… token_id:…\`` line printed in `/watching list` always
+ * works, even if OpenSea can't resolve that address right now.
+ */
+async function handleWatching(deps: CommandRouterDeps, invocation: CommandInvocation): Promise<CommandReply> {
+  const watched = deps.listWatchedItems();
+
+  if (invocation.subcommand === "remove") {
+    const collectionInput = invocation.collection?.trim();
+    const tokenId = invocation.tokenId?.trim();
+    if (!collectionInput || !tokenId) {
+      return { content: "Provide both `collection` and `token_id`. Run `/watching list` to see what's being watched.", ephemeral: true };
+    }
+
+    const resolved = await deps.resolveCollection(collectionInput).catch(() => null);
+    const candidateIds = [resolved?.address, collectionInput].filter((v): v is string => Boolean(v));
+    const match = watched.find(
+      (item) => item.tokenId === tokenId && candidateIds.some((id) => id.toLowerCase() === item.collectionId.toLowerCase()),
+    );
+
+    if (!match) {
+      return {
+        content: `Not watching **${collectionInput} #${tokenId}**. Run \`/watching list\` to see what is being watched.`,
+        ephemeral: true,
+      };
+    }
+
+    const removed = deps.removeWatchedItem(match.collectionId, match.tokenId);
+    return {
+      content: removed
+        ? `🚫 Stopped watching **${match.collectionName} #${match.tokenId}**.`
+        : `Could not stop watching **${match.collectionName} #${match.tokenId}** — it may have just been removed.`,
+      ephemeral: true,
+    };
+  }
+
+  const ethUsdRate = await deps.getEthUsdRate();
+  return { embed: buildWatchingEmbed(watched, ethUsdRate), ephemeral: true };
+}
+
+/** `/whale add|remove|list`. Validation lives in WhaleStore so it's shared with any other caller. */
+function handleWhale(deps: CommandRouterDeps, invocation: CommandInvocation): CommandReply {
+  if (invocation.subcommand === "list") {
+    return { embed: buildWhaleListEmbed(deps.listWhales()), ephemeral: true };
+  }
+
+  const address = invocation.address?.trim();
+  if (!address) return { content: "Provide an `address` (0x…).", ephemeral: true };
+
+  if (invocation.subcommand === "add") {
+    const outcome = deps.addWhale(address, invocation.label?.trim() || undefined);
+    return {
+      content: outcome.ok
+        ? `🐋 ${outcome.message}\nAlerts fire only for activity **inside allowlisted collections**.`
+        : `⚠️ ${outcome.message}`,
+      ephemeral: true,
+    };
+  }
+
+  if (invocation.subcommand === "remove") {
+    const outcome = deps.removeWhale(address);
+    return { content: outcome.ok ? `🗑️ ${outcome.message}` : `⚠️ ${outcome.message}`, ephemeral: true };
+  }
+
+  return { content: "Unknown /whale subcommand.", ephemeral: true };
+}
+
+function isGlobalSettingKey(key: string): key is GlobalSettingKey {
+  return (GLOBAL_SETTING_KEYS as string[]).includes(key);
+}
+
+function isEntrySettingKey(key: string): key is EntrySettingKey {
+  return (ENTRY_SETTING_KEYS as string[]).includes(key);
+}
+
+/**
+ * `/config show|set|reset|entry`. Authorization is already enforced at
+ * routeCommand's entry point (authorized user only), and every value is
+ * validated by the Zod-backed planners in watchlist/configMutate.ts before
+ * anything is written — so an out-of-range or malformed value is rejected
+ * with a reason rather than persisted.
+ */
+async function handleConfig(deps: CommandRouterDeps, invocation: CommandInvocation): Promise<CommandReply> {
+  if (!invocation.subcommand || invocation.subcommand === "show") {
+    return { embed: buildConfigEmbed(deps.describeSettings()), ephemeral: true };
+  }
+
+  const key = invocation.key?.trim();
+
+  if (invocation.subcommand === "set") {
+    const value = invocation.value?.trim();
+    if (!key || value === undefined) return { content: "Provide both `key` and `value`.", ephemeral: true };
+    if (!isGlobalSettingKey(key)) return { content: `Unknown setting \`${key}\`.`, ephemeral: true };
+
+    const outcome = deps.setGlobalSetting(key, value);
+    return { content: outcome.ok ? `✅ ${outcome.message}` : `⚠️ ${outcome.message}`, ephemeral: true };
+  }
+
+  if (invocation.subcommand === "reset") {
+    if (!key) return { content: "Provide a `key`.", ephemeral: true };
+    if (!isGlobalSettingKey(key)) return { content: `Unknown setting \`${key}\`.`, ephemeral: true };
+
+    const outcome = deps.resetGlobalSetting(key);
+    return { content: outcome.ok ? `✅ ${outcome.message}` : `⚠️ ${outcome.message}`, ephemeral: true };
+  }
+
+  if (invocation.subcommand === "entry") {
+    const collectionInput = invocation.collection?.trim();
+    const value = invocation.value?.trim();
+    if (!collectionInput || !key || value === undefined) {
+      return { content: "Provide `collection`, `key`, and `value`.", ephemeral: true };
+    }
+    if (!isEntrySettingKey(key)) return { content: `Unknown per-collection setting \`${key}\`.`, ephemeral: true };
+
+    // Prefer the canonical address so a friendly name still matches the
+    // stored entry, but pass the raw input through when resolution fails —
+    // planSetEntrySetting also matches on label and id.
+    const resolved = await deps.resolveCollection(collectionInput).catch(() => null);
+    const outcome = deps.setEntrySetting(resolved?.address ?? collectionInput, key, value);
+    return { content: outcome.ok ? `✅ ${outcome.message}` : `⚠️ ${outcome.message}`, ephemeral: true };
+  }
+
+  return { content: "Unknown /config subcommand.", ephemeral: true };
+}
+
+/** `/portfolio` — READ-ONLY view of a public address. See src/portfolio/portfolio.ts. */
+async function handlePortfolio(deps: CommandRouterDeps): Promise<CommandReply> {
+  const snapshot = await deps.getPortfolio();
+  if (!snapshot) {
+    return {
+      content:
+        "No portfolio address is configured or resolvable. Set `PORTFOLIO_ENS_NAME` (e.g. `neworc.eth`) or `PORTFOLIO_ADDRESS` in `.env`, then restart. " +
+        "This view is strictly read-only — it never needs a private key.",
+      ephemeral: true,
+    };
+  }
+  return { embed: buildPortfolioEmbed(snapshot), ephemeral: true };
 }
 
 async function handleListings(deps: CommandRouterDeps, invocation: CommandInvocation): Promise<CommandReply> {

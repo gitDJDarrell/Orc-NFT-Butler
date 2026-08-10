@@ -103,7 +103,44 @@ function makeDeps(overrides: Partial<CommandRouterDeps> = {}): { deps: CommandRo
       lastTrendCheckAt: null,
       rateLimitHealth: { requestsInLastMinute: 0, budgetPerMinute: 50, queueLength: 0, recent429Count: 0 },
       activitySummary: [],
+      watchedItemCount: 0,
+      whaleCount: 0,
+      lastRecapAt: null,
+      nextRecapAt: new Date(),
+      chartsEnabled: true,
+      portfolioAddress: null,
+      portfolioEnsName: null,
     }),
+
+    // --- Group 3 defaults; individual tests override what they exercise ---
+    listWatchedItems: () => [],
+    removeWatchedItem: (collectionId, tokenId) => {
+      (calls.removeWatchedItem ??= []).push({ collectionId, tokenId });
+      return true;
+    },
+    addWhale: (address, label) => {
+      (calls.addWhale ??= []).push({ address, label });
+      return { ok: true, message: `Now tracking ${label ?? address}.` };
+    },
+    removeWhale: (address) => {
+      (calls.removeWhale ??= []).push({ address });
+      return { ok: true, message: `Stopped tracking ${address}.` };
+    },
+    listWhales: () => [],
+    describeSettings: () => [{ key: "show_usd", value: "true", source: "env" }],
+    setGlobalSetting: (key, value) => {
+      (calls.setGlobalSetting ??= []).push({ key, value });
+      return { ok: true, message: `Set ${key} to ${value}.` };
+    },
+    resetGlobalSetting: (key) => {
+      (calls.resetGlobalSetting ??= []).push({ key });
+      return { ok: true, message: `Reset ${key}.` };
+    },
+    setEntrySetting: (collectionMatcher, key, value) => {
+      (calls.setEntrySetting ??= []).push({ collectionMatcher, key, value });
+      return { ok: true, message: `Set ${key} to ${value}.` };
+    },
+    getPortfolio: async () => null,
     ...overrides,
   };
 

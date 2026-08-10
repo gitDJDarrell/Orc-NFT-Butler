@@ -449,9 +449,10 @@ function buildSopEmbeds(): ReturnType<EmbedBuilder["toJSON"]>[] {
       {
         name: "📣 NOTIFICATIONS (bot posts, humans read-only)",
         value:
-          "#bid-leads — buy-opportunity leads, the ONLY interactive channel: use the Accept/Deny/Watch buttons (or react ✅❌👀), don't type (hourly)\n" +
+          "#bid-leads — buy-opportunity leads, the ONLY interactive channel: use the Accept/Deny/Watch buttons (or react ✅❌👀), don't type (hourly).\n" +
+          "  Also carries 👀 watch follow-ups (price drop, sold, likely delisted) and 🐋 whale activity unless a separate channel is configured.\n" +
           "#new-listings — new listings for allowlisted collections (hourly)\n" +
-          "#trend-alerts — twice-daily trend/floor digest at 8:00 AM & 8:00 PM local\n" +
+          "#trend-alerts — twice-daily trend/floor digest at 8:00 AM & 8:00 PM local, each with a floor/volume chart; also the 🌅 once-daily overnight recap\n" +
           "#watchlist-sales — recent sales for your watched collections (hourly, bot-only feed)",
         inline: false,
       },
@@ -468,7 +469,8 @@ function buildSopEmbeds(): ReturnType<EmbedBuilder["toJSON"]>[] {
     .setColor(0xe6a23c)
     .setDescription(
       "• **DRY-RUN always on** — never signs or broadcasts a transaction.\n" +
-        "• **Allowlist-only** — nothing outside marked collections is ever surfaced.\n" +
+        "• **Allowlist-only** — nothing outside marked collections is ever surfaced. Whale tracking is scoped to allowlisted collections too: a tracked wallet's activity elsewhere is never reported.\n" +
+        "• **/portfolio is READ-ONLY** — a public address resolved from ENS. The bot holds no private key, makes no wallet connection, and cannot sign or spend.\n" +
         "• Only the Operator's button clicks/reactions/commands are ever honored.",
     );
 
@@ -494,19 +496,67 @@ function buildCommandsEmbeds(): ReturnType<EmbedBuilder["toJSON"]>[] {
           "(✅ ACCEPTED / ❌ DENIED / 👀 WATCHING badge + color) once decided.",
         inline: false,
       },
-      { name: "/watchlist add|remove|list", value: "Manage the allowlist. `add collection:<name|slug|address>` · `remove collection:<...>` · `list`", inline: false },
+      { name: "/watchlist add|remove|list|create-rule", value: "Manage the allowlist. `add collection:<name|slug|address>` · `remove collection:<...>` · `list` · `create-rule`", inline: false },
       { name: "/listings collection: hours:", value: "Recent listings within the past N hours (default 24).", inline: false },
       { name: "/floor collection:", value: "Current floor price and stats.", inline: false },
       { name: "/offers collection:", value: "Current top offers/bids.", inline: false },
       {
         name: "/status",
-        value: "Full dashboard: mode, data source, uptime, last poll/trend-check, OpenSea rate-limit health, next trend digest, per-collection activity since startup.",
+        value:
+          "Full dashboard: mode, data source, uptime, last poll/trend-check, OpenSea rate-limit health, next trend digest and daily recap, " +
+          "watched-item and tracked-wallet counts, the read-only portfolio address, per-collection activity since startup.",
         inline: false,
       },
       { name: "/help", value: "Lists all commands (in-Discord).", inline: false },
     );
 
-  return [reference.toJSON()];
+  const groupThree = new EmbedBuilder()
+    .setTitle("Watch · Whales · Config · Portfolio")
+    .setColor(0x5865f2)
+    .addFields(
+      {
+        name: "👀 /watching list · /watching remove collection: token_id:",
+        value:
+          "Marking a lead 👀 (button or reaction) adds it to a **persisted** watch set that survives restarts. " +
+          "Each watched item then generates follow-ups on every poll: **price drop/change**, **sold** (with the sale price vs. what you watched it at), " +
+          "and **likely delisted**. Sold/delisted stop watching automatically.",
+        inline: false,
+      },
+      {
+        name: "🐋 /whale add address: label: · /whale remove address: · /whale list",
+        value:
+          "Track wallet addresses. You get an alert when a tracked wallet **BUYS, SELLS, or LISTS inside an allowlisted collection** — " +
+          "scoped strictly to your watchlist, deduped per event, and rate-limited through the same per-entry limiter as bid leads. " +
+          "Costs no extra API calls: it reads the listings/sales each poll already fetches.",
+        inline: false,
+      },
+      {
+        name: "⚙️ /config show · set · reset · entry",
+        value:
+          "Edit tunables live, no restart. `set key: value:` for globals (show_usd, floor_move_threshold_percent, new_listing_max_price, " +
+          "offer_above_collection_percent, trend_alert_times, daily_recap_time). `entry collection: key: value:` for per-collection settings " +
+          "(muted, enabled, target_buy_price, max_floor, bid-spread bounds, dedupe/rate limits, quiet hours, priority tier). " +
+          "Every value is validated before it's written to watchlist.json; `reset` drops an override back to the .env value.",
+        inline: false,
+      },
+      {
+        name: "📦 /portfolio — READ-ONLY",
+        value:
+          "Holdings for the configured public address (resolved from an ENS name), grouped by collection with floor value and offers received.\n" +
+          "**This is strictly read-only.** The bot holds no private key or seed phrase, performs no wallet connection, signs nothing, and " +
+          "cannot buy, sell, transfer, or approve anything. ENS resolution and all portfolio reads are read-only calls against public data.",
+        inline: false,
+      },
+      {
+        name: "📊 Charts & recap",
+        value:
+          "The twice-daily trend digest attaches a floor/volume chart per moving collection, rendered locally (no external image service). " +
+          "A 🌅 once-daily overnight recap summarizes the past 24h across every watched collection — top gainer/loser, listings, sales, and leads.",
+        inline: false,
+      },
+    );
+
+  return [reference.toJSON(), groupThree.toJSON()];
 }
 
 main().catch((err) => {

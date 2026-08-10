@@ -1,4 +1,5 @@
 import { config } from "../config/env.js";
+import { getShowUsd } from "../config/runtime.js";
 import type { BidInfo, CollectionInfo, CollectionOfferInfo, CollectionSearchResult, ListingInfo, OfferScope, SaleInfo, Trait, TraitCategory } from "../types/index.js";
 import { RequestScheduler, type RateLimitHealth } from "./requestScheduler.js";
 import {
@@ -330,10 +331,12 @@ export class OpenSeaClient {
    *      above fail — better than no number if we had one recently.
    *   4. undefined if we've never once had a rate — callers must treat this
    *      as "show ETH only", never fabricate a USD figure.
-   * Disabled entirely (always returns undefined) when SHOW_USD=false.
+   * Disabled entirely (always returns undefined) when SHOW_USD is off —
+   * read through src/config/runtime.ts so `/config set show_usd false`
+   * takes effect immediately, without a restart.
    */
   async getEthUsdRate(): Promise<number | undefined> {
-    if (!config.SHOW_USD) return undefined;
+    if (!getShowUsd()) return undefined;
     if (this.usingMockData) return mockEthUsdRate();
 
     const now = Date.now();
@@ -689,6 +692,60 @@ export class OpenSeaClient {
     }
   }
 
+  /**
+   * NFTs held by a PUBLIC account address, via GET
+   * /chain/{chain}/account/{address}/nfts — the read side of the read-only
+   * portfolio view (see src/portfolio/portfolio.ts). Paginates until
+   * `maxItems` is reached or OpenSea runs out of pages.
+   *
+   * SAFETY: this is a GET against a public address. It conveys no ownership,
+   * requires no signature, and cannot move anything.
+   *
+   * Deliberately returns [] (rather than mock holdings) when no API key is
+   * configured: inventing a fake portfolio would be actively misleading in a
+   * way that a fake floor price is not — the caller surfaces "requires a live
+   * API key" instead.
+   */
+  async getNftsByAccount(address: string, maxItems = 200): Promise<AccountNft[]> {
+    if (this.usingMockData) {
+      console.warn("[opensea] getNftsByAccount requires a live OPENSEA_API_KEY — returning no holdings rather than fabricating a portfolio.");
+      return [];
+    }
+
+    const collected: AccountNft[] = [];
+    let next: string | undefined;
+
+    try {
+      // Bounded page loop — OpenSea caps `limit` at 200, and the guard stops
+      // a malformed `next` cursor from looping forever.
+      for (let page = 0; page < 10 && collected.length < maxItems; page++) {
+        const data: OpenSeaAccountNftsResponse = await this.request<OpenSeaAccountNftsResponse>(
+          `/chain/${config.CHAIN_NAME}/account/${address}/nfts`,
+          { limit: Math.min(50, maxItems - collected.length), next },
+        );
+
+        for (const nft of data.nfts ?? []) {
+          if (!nft.contract || nft.identifier === undefined) continue;
+          collected.push({
+            contract: nft.contract.toLowerCase(),
+            tokenId: nft.identifier,
+            collectionSlug: nft.collection ?? "",
+            name: nft.name ?? undefined,
+            imageUrl: nft.display_image_url || nft.image_url || undefined,
+          });
+        }
+
+        next = data.next;
+        if (!next) break;
+      }
+      return collected.slice(0, maxItems);
+    } catch (err) {
+      console.warn(`[opensea] failed to fetch account NFTs for ${address}: ${(err as Error).message}`);
+      // Partial results are still useful and are real (not fabricated) — return what we got.
+      return collected;
+    }
+  }
+
   private mapSaleEvent(e: OpenSeaSaleEvent, collectionId: string): SaleInfo {
     const priceNative = toNativeAmount(e.payment?.quantity, e.payment?.decimals);
     const priceCurrency = e.payment?.symbol ?? "ETH";
@@ -861,6 +918,28 @@ interface OpenSeaNftResponse {
 interface NftDetails {
   imageUrl?: string;
   traits: Trait[];
+}
+
+/** One NFT held by a public account address — see getNftsByAccount. */
+export interface AccountNft {
+  /** Contract address, lowercased. */
+  contract: string;
+  tokenId: string;
+  collectionSlug: string;
+  name?: string;
+  imageUrl?: string;
+}
+
+interface OpenSeaAccountNftsResponse {
+  nfts?: Array<{
+    identifier?: string;
+    collection?: string;
+    contract?: string;
+    name?: string;
+    image_url?: string;
+    display_image_url?: string;
+  }>;
+  next?: string;
 }
 
 interface OpenSeaSearchCollection {

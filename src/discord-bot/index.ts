@@ -1,5 +1,6 @@
 import type { NftDeFiAgent } from "../agent/index.js";
 import { config } from "../config/env.js";
+import { resolvePortfolioAddress } from "../portfolio/portfolio.js";
 import { BidLeadMonitor } from "../watchlist/leadMonitor.js";
 import { createDiscordBotClient, type DiscordBotClient } from "./client.js";
 
@@ -24,17 +25,28 @@ export async function startDiscordBot(agent: NftDeFiAgent): Promise<DiscordBotHa
   }
 
   let bot: DiscordBotClient;
-  const leadMonitor = new BidLeadMonitor(
-    async (match, candidate) => bot.postBidLead(candidate, match),
-    async (candidate, previousPrice) => bot.notifyWatchedChange(candidate, previousPrice),
-    async (alert) => bot.postNewListing(alert),
-    async (alert) => bot.postTrendAlert(alert),
-    async (sale, collectionName, ethUsdRate) => bot.postSale(sale, collectionName, ethUsdRate),
-    undefined, // seenStore: use the default (real, persisted-to-disk) store
-    async (params) => bot.postListingRecurrence(params),
-  );
+  // Named handlers rather than the old positional argument list — see
+  // BidLeadMonitorOptions. Stores are left at their defaults (the real,
+  // persisted-to-disk ones).
+  const leadMonitor = new BidLeadMonitor({
+    onLead: async (match, candidate) => bot.postBidLead(candidate, match),
+    onWatchedChange: async (candidate, previousPrice) => bot.notifyWatchedChange(candidate, previousPrice),
+    onNewListing: async (alert) => bot.postNewListing(alert),
+    onTrendAlertWithChart: async (alert, chart) => bot.postTrendAlertWithChart(alert, chart),
+    onSale: async (sale, collectionName, ethUsdRate) => bot.postSale(sale, collectionName, ethUsdRate),
+    onListingRecurrence: async (params) => bot.postListingRecurrence(params),
+    onWatchedSold: async (item, sale) => bot.notifyWatchedSold(item, sale),
+    onWatchedDelisted: async (item) => bot.notifyWatchedDelisted(item),
+    onWhaleActivity: async (activity) => bot.postWhaleActivity(activity),
+    onRecap: async (summary, charts) => bot.postRecap(summary, charts),
+  });
 
   bot = createDiscordBotClient(agent, leadMonitor);
+
+  // Resolve the READ-ONLY portfolio address once at startup so /status can
+  // show it without blocking on an ENS round-trip. Fire-and-forget: a
+  // resolution failure is logged inside and must never block bot login.
+  void resolvePortfolioAddress().catch(() => undefined);
 
   try {
     await bot.login();

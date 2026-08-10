@@ -119,9 +119,36 @@ export const allowlistEntrySchema = z
   })
   .strict();
 
+/**
+ * Global tunables editable from Discord via `/config set` (Group 3.4).
+ * Every field is optional: an absent field means "fall back to the .env
+ * value", so watchlist.json stays a pure override layer and deleting a key
+ * restores the environment default (see src/config/runtime.ts).
+ */
+export const globalSettingsSchema = z
+  .object({
+    /** Overrides SHOW_USD. */
+    showUsd: z.boolean().optional(),
+    /** Overrides FLOOR_MOVE_THRESHOLD, expressed as a PERCENT (5 = 5%) rather than .env's fraction — percent is what the operator types in Discord. */
+    floorMoveThresholdPercent: z.number().positive().max(100).optional(),
+    /** Overrides NEW_LISTING_MAX_PRICE (native units, e.g. ETH). */
+    newListingMaxPrice: z.number().nonnegative().optional(),
+    /** Overrides OFFER_ABOVE_COLLECTION_THRESHOLD_PERCENT. */
+    offerAboveCollectionThresholdPercent: z.number().nonnegative().max(1000).optional(),
+    /** Overrides TREND_ALERT_TIMES, e.g. "08:00,20:00". */
+    trendAlertTimes: z
+      .string()
+      .regex(/^([01]\d|2[0-3]):[0-5]\d(,([01]\d|2[0-3]):[0-5]\d)*$/, "expected comma-separated 24h HH:MM times")
+      .optional(),
+    /** Overrides DAILY_RECAP_TIME, e.g. "07:00". */
+    dailyRecapTime: z.string().regex(HH_MM, "expected 24h HH:MM").optional(),
+  })
+  .strict();
+
 export const allowlistConfigSchema = z
   .object({
     entries: z.array(allowlistEntrySchema),
+    settings: globalSettingsSchema.optional(),
   })
   .strict();
 
@@ -132,3 +159,4 @@ export type WatchlistFilters = z.infer<typeof watchlistFiltersSchema>;
 export type QuietHours = z.infer<typeof quietHoursSchema>;
 export type AllowlistEntry = z.infer<typeof allowlistEntrySchema>;
 export type AllowlistConfig = z.infer<typeof allowlistConfigSchema>;
+export type GlobalSettings = z.infer<typeof globalSettingsSchema>;

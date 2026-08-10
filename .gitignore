@@ -24,8 +24,12 @@ yarn-debug.log*
 yarn-error.log*
 
 # --- Runtime state / locks / pids ---
-.watchlist-seen-state.json
-.watchlist-listing-anchors.json
+# Glob rather than an explicit list so a newly-added store (watched items,
+# whales, floor history, ...) is ignored by default instead of being
+# accidentally committed the first time it's written. NOTE: watchlist.json
+# itself is CONFIG, not state, and is deliberately tracked — the leading
+# dot is what separates the two.
+.watchlist-*.json
 .bot.lock
 .bot.pid
 *.pid

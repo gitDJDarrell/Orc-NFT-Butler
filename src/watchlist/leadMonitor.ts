@@ -1,22 +1,45 @@
 import { resolve } from "node:path";
 import { config } from "../config/env.js";
+import {
+  applySettingsOverrides,
+  getDailyRecapTime,
+  getFloorMoveThreshold,
+  getNewListingMaxPrice,
+  getOfferAboveCollectionThresholdPercent,
+  getTrendAlertTimes,
+} from "../config/runtime.js";
 import { formatPriceWithUsd, openseaClient } from "../opensea/client.js";
 import type { Alert, CollectionInfo, ListingInfo, SaleInfo, Trait } from "../types/index.js";
 import type { BidLeadCandidate } from "./candidate.js";
 import { evaluateCandidate, type WatchlistMatch } from "./evaluate.js";
+import { renderFloorChart } from "../chart/floorChart.js";
+import { FloorHistoryStore, type FloorSample } from "./historyStore.js";
 import { ListingAnchorStore } from "./listingAnchorStore.js";
 import { LeadLimiter } from "./limiter.js";
+import { buildRecapSummary, emptyCounters, type RecapCounters, type RecapSummary } from "./recap.js";
 import { SeenStore } from "./seenStore.js";
 import { getAllowlistedCollectionIds, loadWatchlistConfig } from "./store.js";
 import type { AllowlistConfig, AllowlistEntry } from "./schema.js";
 import { WatchStore, type WatchedItem } from "./watchStore.js";
+import { WhaleStore, type WhaleActivity, type WhaleWallet } from "./whaleStore.js";
 
 const SEEN_STORE_PATH = resolve(process.cwd(), ".watchlist-seen-state.json");
 const LISTING_ANCHOR_STORE_PATH = resolve(process.cwd(), ".watchlist-listing-anchors.json");
 const WATCH_STORE_PATH = resolve(process.cwd(), ".watchlist-watched-items.json");
+const WHALE_STORE_PATH = resolve(process.cwd(), ".watchlist-whales.json");
+const HISTORY_STORE_PATH = resolve(process.cwd(), ".watchlist-floor-history.json");
 
 /** Consecutive poll ticks a watched token can go missing from both recent-listings and recent-sales before it's treated as likely delisted. See WatchedItem.missingTicks for the caveat. */
 const DELIST_THRESHOLD_TICKS = 3;
+
+/** Window the once-daily recap summarizes. 24h so consecutive recaps tile the calendar with no gap or overlap. */
+const RECAP_WINDOW_HOURS = 24;
+
+/** Discord allows up to 10 attachments per message; cap below that so a large watchlist can't turn the recap into an image dump. */
+const MAX_RECAP_CHARTS = 5;
+
+/** Hours of history the trend digest's per-collection chart plots. */
+const TREND_CHART_WINDOW_HOURS = 24;
 
 export type BidLeadHandler = (match: WatchlistMatch, candidate: BidLeadCandidate) => void | Promise<void>;
 export type WatchedChangeHandler = (candidate: BidLeadCandidate, previousPriceNative: number) => void | Promise<void>;
@@ -24,6 +47,12 @@ export type WatchedSoldHandler = (item: WatchedItem, sale: SaleInfo) => void | P
 export type WatchedDelistedHandler = (item: WatchedItem) => void | Promise<void>;
 export type AlertHandler = (alert: Alert) => void | Promise<void>;
 export type SaleHandler = (sale: SaleInfo, collectionName: string, ethUsdRate: number | undefined) => void | Promise<void>;
+/** A marked wallet bought/sold/listed inside an allowlisted collection (Group 3.2). */
+export type WhaleActivityHandler = (activity: WhaleActivity) => void | Promise<void>;
+/** The once-daily overnight recap, with an optional locally-rendered chart PNG per collection. */
+export type RecapHandler = (summary: RecapSummary, charts: Array<{ label: string; png: Buffer }>) => void | Promise<void>;
+/** The twice-daily trend digest, optionally carrying a locally-rendered chart PNG. */
+export type TrendAlertWithChartHandler = (alert: Alert, chart: { label: string; png: Buffer } | undefined) => void | Promise<void>;
 /** New-listing / price-change alerts need the posted message's ID back (to anchor future threading), unlike the fire-and-forget AlertHandler used for the trend digest. */
 export type NewListingHandler = (alert: Alert) => Promise<string | undefined>;
 /**
@@ -109,6 +138,34 @@ export function msUntilNext(time: TrendTime, from: Date = new Date()): number {
  * whatever's currently on the market and post it as if it just
  * appeared — a backfill burst, not a real signal. See pollCollection().
  */
+/**
+ * Handlers + injectable stores. An options object rather than the positional
+ * parameter list this used to have: Group 3 added enough optional handlers
+ * (whale activity, recap, chart-carrying trend digest) that positional
+ * construction had become a long run of `undefined` placeholders at every
+ * call site, where a single mis-ordered argument would silently wire the
+ * wrong callback.
+ */
+export interface BidLeadMonitorOptions {
+  onLead: BidLeadHandler;
+  onWatchedChange?: WatchedChangeHandler;
+  onNewListing?: NewListingHandler;
+  /** Fired when no chart is available/enabled; onTrendAlertWithChart takes precedence when set. */
+  onTrendAlert?: AlertHandler;
+  onTrendAlertWithChart?: TrendAlertWithChartHandler;
+  onSale?: SaleHandler;
+  onListingRecurrence?: ListingRecurrenceHandler;
+  onWatchedSold?: WatchedSoldHandler;
+  onWatchedDelisted?: WatchedDelistedHandler;
+  onWhaleActivity?: WhaleActivityHandler;
+  onRecap?: RecapHandler;
+  seenStore?: SeenStore;
+  listingAnchorStore?: ListingAnchorStore;
+  watchStore?: WatchStore;
+  whaleStore?: WhaleStore;
+  historyStore?: FloorHistoryStore;
+}
+
 export class BidLeadMonitor {
   private watchlistConfig: AllowlistConfig;
   private collections: string[];
@@ -116,57 +173,73 @@ export class BidLeadMonitor {
   private readonly limiter = new LeadLimiter();
   private readonly seenStore: SeenStore;
   private readonly watchStore: WatchStore;
+  private readonly whaleStore: WhaleStore;
+  private readonly historyStore: FloorHistoryStore;
   /** Floor price recorded at the last twice-daily trend check, per collection — the baseline the next check compares against. */
   private readonly lastTrendFloor = new Map<string, number>();
   private readonly onLead: BidLeadHandler;
   private readonly onWatchedChange: WatchedChangeHandler | undefined;
   private readonly onNewListing: NewListingHandler | undefined;
   private readonly onTrendAlert: AlertHandler | undefined;
+  private readonly onTrendAlertWithChart: TrendAlertWithChartHandler | undefined;
   private readonly onSale: SaleHandler | undefined;
   private readonly onListingRecurrence: ListingRecurrenceHandler | undefined;
   private readonly onWatchedSold: WatchedSoldHandler | undefined;
   private readonly onWatchedDelisted: WatchedDelistedHandler | undefined;
+  private readonly onWhaleActivity: WhaleActivityHandler | undefined;
+  private readonly onRecap: RecapHandler | undefined;
   private readonly listingAnchorStore: ListingAnchorStore;
   private timer: ReturnType<typeof setInterval> | null = null;
   private trendTimers: ReturnType<typeof setTimeout>[] = [];
+  private recapTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** For /status: process start time, last poll/trend-check completion, and per-collection activity counts — all in-memory, resets on restart same as everything else here. */
   private readonly startedAt = Date.now();
   private lastPollCompletedAt: string | null = null;
   private lastTrendCheckAt: string | null = null;
+  private lastRecapAt: string | null = null;
   private readonly activityCounts = new Map<string, { listings: number; sales: number; leads: number }>();
+  /** Per-collection counters for the CURRENT recap window — reset every time a recap posts, unlike activityCounts which is cumulative since startup. */
+  private readonly recapCounters = new Map<string, RecapCounters>();
 
   private bumpActivity(collectionId: string, kind: "listings" | "sales" | "leads"): void {
     const counts = this.activityCounts.get(collectionId) ?? { listings: 0, sales: 0, leads: 0 };
     counts[kind] += 1;
     this.activityCounts.set(collectionId, counts);
+
+    const recap = this.recapCounters.get(collectionId) ?? emptyCounters();
+    recap[kind] += 1;
+    this.recapCounters.set(collectionId, recap);
   }
 
-  constructor(
-    onLead: BidLeadHandler,
-    onWatchedChange?: WatchedChangeHandler,
-    onNewListing?: NewListingHandler,
-    onTrendAlert?: AlertHandler,
-    onSale?: SaleHandler,
-    seenStore: SeenStore = new SeenStore(SEEN_STORE_PATH),
-    onListingRecurrence?: ListingRecurrenceHandler,
-    listingAnchorStore: ListingAnchorStore = new ListingAnchorStore(LISTING_ANCHOR_STORE_PATH),
-    onWatchedSold?: WatchedSoldHandler,
-    onWatchedDelisted?: WatchedDelistedHandler,
-    watchStore: WatchStore = new WatchStore(WATCH_STORE_PATH),
-  ) {
-    this.onLead = onLead;
-    this.onWatchedChange = onWatchedChange;
-    this.onNewListing = onNewListing;
-    this.onTrendAlert = onTrendAlert;
-    this.onSale = onSale;
-    this.seenStore = seenStore;
-    this.onListingRecurrence = onListingRecurrence;
-    this.listingAnchorStore = listingAnchorStore;
-    this.onWatchedSold = onWatchedSold;
-    this.onWatchedDelisted = onWatchedDelisted;
-    this.watchStore = watchStore;
+  private addRecapVolume(collectionId: string, valueNative: number): void {
+    const recap = this.recapCounters.get(collectionId) ?? emptyCounters();
+    recap.salesVolumeNative += valueNative;
+    this.recapCounters.set(collectionId, recap);
+  }
+
+  constructor(options: BidLeadMonitorOptions) {
+    this.onLead = options.onLead;
+    this.onWatchedChange = options.onWatchedChange;
+    this.onNewListing = options.onNewListing;
+    this.onTrendAlert = options.onTrendAlert;
+    this.onTrendAlertWithChart = options.onTrendAlertWithChart;
+    this.onSale = options.onSale;
+    this.onListingRecurrence = options.onListingRecurrence;
+    this.onWatchedSold = options.onWatchedSold;
+    this.onWatchedDelisted = options.onWatchedDelisted;
+    this.onWhaleActivity = options.onWhaleActivity;
+    this.onRecap = options.onRecap;
+    this.seenStore = options.seenStore ?? new SeenStore(SEEN_STORE_PATH);
+    this.listingAnchorStore = options.listingAnchorStore ?? new ListingAnchorStore(LISTING_ANCHOR_STORE_PATH);
+    this.watchStore = options.watchStore ?? new WatchStore(WATCH_STORE_PATH);
+    this.whaleStore = options.whaleStore ?? new WhaleStore(WHALE_STORE_PATH);
+    this.historyStore = options.historyStore ?? new FloorHistoryStore(HISTORY_STORE_PATH);
+
     this.watchlistConfig = loadWatchlistConfig(config.WATCHLIST_CONFIG_PATH);
+    // Global /config overrides live in watchlist.json and must be in effect
+    // before anything reads a tunable (see src/config/runtime.ts).
+    applySettingsOverrides(this.watchlistConfig.settings);
     this.collections = getAllowlistedCollectionIds(this.watchlistConfig);
 
     for (const id of this.collections) {
@@ -181,6 +254,23 @@ export class BidLeadMonitor {
     if (this.collections.length === 0) {
       console.warn("[bid-leads] No enabled watchlist.json entries — bid-lead generation is idle until you add some.");
     }
+  }
+
+  // --- Whale tracking (Group 3.2) ---------------------------------------
+
+  /** `/whale add`. Alerts are emitted ONLY for activity inside allowlisted collections — see checkWhaleActivity. */
+  addWhale(address: string, label?: string): { ok: boolean; message: string } {
+    return this.whaleStore.add(address, label);
+  }
+
+  /** `/whale remove`. */
+  removeWhale(address: string): { ok: boolean; message: string } {
+    return this.whaleStore.remove(address);
+  }
+
+  /** `/whale list`. */
+  getWhales(): WhaleWallet[] {
+    return this.whaleStore.getAll();
   }
 
   getAllowlistedCollections(): string[] {
@@ -231,6 +321,8 @@ export class BidLeadMonitor {
     for (const id of removed) {
       this.state.delete(id);
       this.lastTrendFloor.delete(id);
+      this.recapCounters.delete(id);
+      this.historyStore.forget(id);
       this.seenStore.forget(id); // if re-added later, it re-baselines from scratch rather than acting on years-stale dedupe state
     }
     for (const id of added) {
@@ -244,11 +336,31 @@ export class BidLeadMonitor {
 
     this.watchlistConfig = newConfig;
     this.collections = newCollections;
+    // Re-apply /config overrides — a reload follows every `/config set`, and
+    // this is what makes the new value take effect process-wide immediately.
+    applySettingsOverrides(newConfig.settings);
     console.log(`[bid-leads] Reloaded watchlist.json — now watching ${this.collections.length} collection(s).`);
 
     for (const id of added) void this.pollCollection(id);
 
+    // A /config change to trend_alert_times or daily_recap_time only takes
+    // effect once the old timers are torn down and rebuilt against the new
+    // schedule — without this, the change would silently not apply until the
+    // next process restart.
+    this.rescheduleDigests();
     this.ensureTimersRunning();
+  }
+
+  /** Drops and rebuilds the trend + recap schedules, so an edited schedule applies immediately. */
+  private rescheduleDigests(): void {
+    for (const t of this.trendTimers) clearTimeout(t);
+    this.trendTimers = [];
+    if (this.recapTimer) {
+      clearTimeout(this.recapTimer);
+      this.recapTimer = null;
+    }
+    this.startTrendSchedule();
+    this.startRecapSchedule();
   }
 
   /** Seconds since this monitor (i.e. the process) started. Used by /status. */
@@ -275,10 +387,27 @@ export class BidLeadMonitor {
     });
   }
 
+  /** ISO timestamp the last daily recap posted, or null if none has fired yet. Used by /status. */
+  getLastRecapAt(): string | null {
+    return this.lastRecapAt;
+  }
+
+  /** Soonest upcoming daily-recap firing, or null if it isn't configured/parseable. Used by /status. */
+  getNextRecapTime(): Date | null {
+    try {
+      const times = parseTrendAlertTimes(getDailyRecapTime());
+      if (times.length === 0) return null;
+      const now = new Date();
+      return new Date(now.getTime() + msUntilNext(times[0]!, now));
+    } catch {
+      return null;
+    }
+  }
+
   /** Soonest upcoming trend-digest firing, or null if none are configured/parseable. Used by /status. */
   getNextTrendCheckTime(): Date | null {
     try {
-      const times = parseTrendAlertTimes(config.TREND_ALERT_TIMES);
+      const times = parseTrendAlertTimes(getTrendAlertTimes());
       if (times.length === 0) return null;
       const now = new Date();
       const soonestMs = Math.min(...times.map((t) => msUntilNext(t, now)));
@@ -312,6 +441,7 @@ export class BidLeadMonitor {
       this.timer = setInterval(() => void this.pollOnce(), config.POLL_INTERVAL_SECONDS * 1000);
     }
     this.startTrendSchedule();
+    this.startRecapSchedule();
   }
 
   stop(): void {
@@ -321,6 +451,10 @@ export class BidLeadMonitor {
     }
     for (const t of this.trendTimers) clearTimeout(t);
     this.trendTimers = [];
+    if (this.recapTimer) {
+      clearTimeout(this.recapTimer);
+      this.recapTimer = null;
+    }
   }
 
   private async pollCollection(collectionId: string): Promise<void> {
@@ -341,6 +475,15 @@ export class BidLeadMonitor {
           : undefined;
       state.lastFloorPrice = floor.floorPriceNative;
       state.lastFloorName = floor.name;
+
+      // Record the floor/volume reading this tick ALREADY fetched — the
+      // series behind the trend chart and the daily recap costs no extra
+      // OpenSea calls.
+      this.historyStore.record(collectionId, {
+        t: new Date().toISOString(),
+        floor: floor.floorPriceNative,
+        volume: floor.volume24hNative,
+      });
 
       // This collection's very first poll ever (nothing persisted for it in
       // seenStore) establishes a silent baseline instead of treating
@@ -382,6 +525,10 @@ export class BidLeadMonitor {
       for (const sale of newSales) await this.emitSale(sale, floor.name, ethUsdRate);
 
       await this.checkWatchedSubjects(collectionId, floor.name, listings, sales);
+
+      // Whale scan reads the SAME listings/sales already in hand — strictly
+      // allowlist-scoped by construction, and zero additional API calls.
+      await this.checkWhaleActivity(collectionId, floor.name, newListings, newSales, ethUsdRate);
 
       for (const listing of recurringListings) {
         const { imageUrl } = await openseaClient.getNftDetails(listing.collectionId, listing.tokenId);
@@ -440,7 +587,7 @@ export class BidLeadMonitor {
     ethUsdRate: number | undefined,
   ): Promise<void> {
     if (!this.onNewListing) return;
-    if (listing.priceNative > config.NEW_LISTING_MAX_PRICE) return;
+    if (listing.priceNative > getNewListingMaxPrice()) return;
 
     const priorAnchor = this.listingAnchorStore.get(listing.collectionId, listing.tokenId);
     const isPriceChange =
@@ -563,6 +710,107 @@ export class BidLeadMonitor {
 
     await this.onSale(sale, collectionName, ethUsdRate);
     this.bumpActivity(sale.collectionId, "sales");
+    this.addRecapVolume(sale.collectionId, sale.priceNative);
+  }
+
+  /**
+   * Alerts when a `/whale add`-marked wallet buys, sells, or lists inside an
+   * ALLOWLISTED collection (Group 3.2).
+   *
+   * Scoping: this is only ever called from pollCollection, over the listings
+   * and sales already fetched for a collection that is on the allowlist by
+   * construction — so a marked wallet's activity anywhere else is
+   * structurally invisible here, not merely filtered out. It also costs no
+   * additional OpenSea reads.
+   *
+   * Dedupe + throttle: routed through the same per-entry LeadLimiter as bid
+   * leads, under its own `whale:` key namespace so it can never suppress (or
+   * be suppressed by) a regular lead, sale, or offer for the same token. The
+   * key includes the specific event ID, so a genuinely new event always gets
+   * through while a re-observed one never double-posts. Entry mute and quiet
+   * hours apply, same as every other signal.
+   */
+  private async checkWhaleActivity(
+    collectionId: string,
+    collectionName: string,
+    listings: ListingInfo[],
+    sales: SaleInfo[],
+    ethUsdRate: number | undefined,
+  ): Promise<void> {
+    if (!this.onWhaleActivity || this.whaleStore.size === 0) return;
+
+    const entry = this.watchlistConfig.entries.find((e) => e.enabled && e.collection.toLowerCase() === collectionId.toLowerCase());
+    if (!entry) return; // not allowlisted — cannot happen via pollCollection, but keeps the allowlist-only posture explicit
+
+    const emit = async (activity: WhaleActivity, eventId: string): Promise<void> => {
+      const dedupeKey = `whale:${activity.wallet.address}:${activity.action}:${collectionId}:${activity.tokenId}:${eventId}`;
+      if (this.limiter.check(entry, dedupeKey)) return;
+      this.limiter.recordFired(entry, dedupeKey);
+      await this.onWhaleActivity!(activity);
+    };
+
+    for (const sale of sales) {
+      const buyer = this.whaleStore.get(sale.buyer);
+      if (buyer) {
+        await emit(
+          {
+            wallet: buyer,
+            action: "bought",
+            collectionId,
+            collectionName,
+            tokenId: sale.tokenId,
+            priceNative: sale.priceNative,
+            priceCurrency: sale.priceCurrency,
+            timestamp: sale.createdAt,
+            transactionHash: sale.transactionHash,
+            imageUrl: sale.imageUrl,
+            counterparty: sale.seller,
+            ethUsdRate,
+          },
+          sale.id,
+        );
+      }
+
+      const seller = this.whaleStore.get(sale.seller);
+      if (seller) {
+        await emit(
+          {
+            wallet: seller,
+            action: "sold",
+            collectionId,
+            collectionName,
+            tokenId: sale.tokenId,
+            priceNative: sale.priceNative,
+            priceCurrency: sale.priceCurrency,
+            timestamp: sale.createdAt,
+            transactionHash: sale.transactionHash,
+            imageUrl: sale.imageUrl,
+            counterparty: sale.buyer,
+            ethUsdRate,
+          },
+          sale.id,
+        );
+      }
+    }
+
+    for (const listing of listings) {
+      const lister = this.whaleStore.get(listing.seller);
+      if (!lister) continue;
+      await emit(
+        {
+          wallet: lister,
+          action: "listed",
+          collectionId,
+          collectionName,
+          tokenId: listing.tokenId,
+          priceNative: listing.priceNative,
+          priceCurrency: listing.priceCurrency,
+          timestamp: listing.createdAt,
+          ethUsdRate,
+        },
+        listing.id,
+      );
+    }
   }
 
   /** Highest currently active collection-wide (not trait/token) offer for a collection, or undefined if none/unavailable. */
@@ -599,7 +847,7 @@ export class BidLeadMonitor {
     const bestOffer = await openseaClient.getBestOfferForToken(candidate.collectionId, candidate.tokenId);
     if (!bestOffer || bestOffer.scope === "collection") return;
 
-    const thresholdMultiplier = 1 + config.OFFER_ABOVE_COLLECTION_THRESHOLD_PERCENT / 100;
+    const thresholdMultiplier = 1 + getOfferAboveCollectionThresholdPercent() / 100;
     if (bestOffer.priceNative < topCollectionOfferNative * thresholdMultiplier) return;
 
     const dedupeKey = `offer:${candidate.collectionId}:${candidate.tokenId}`;
@@ -640,11 +888,12 @@ export class BidLeadMonitor {
    * (correct across DST/day-length changes) instead of drifting.
    */
   private startTrendSchedule(): void {
-    if (this.trendTimers.length > 0 || this.collections.length === 0 || !this.onTrendAlert) return;
+    if (this.trendTimers.length > 0 || this.collections.length === 0) return;
+    if (!this.onTrendAlert && !this.onTrendAlertWithChart) return;
 
     let times: TrendTime[];
     try {
-      times = parseTrendAlertTimes(config.TREND_ALERT_TIMES);
+      times = parseTrendAlertTimes(getTrendAlertTimes());
     } catch (err) {
       console.error(`[trend-alert] ${(err as Error).message} — trend digest disabled.`);
       return;
@@ -653,6 +902,97 @@ export class BidLeadMonitor {
     for (const time of times) {
       this.scheduleNextTrendCheck(time);
     }
+  }
+
+  /**
+   * Schedules the once-daily overnight recap (Group 3.3). Separate schedule
+   * and separate channel from the twice-daily trend digest: the digest
+   * reports individual floor MOVES as they cross a threshold, while this
+   * summarizes the whole preceding window across every watched collection
+   * whether or not anything crossed a threshold.
+   */
+  private startRecapSchedule(): void {
+    if (this.recapTimer || this.collections.length === 0 || !this.onRecap) return;
+
+    let time: TrendTime;
+    try {
+      const parsed = parseTrendAlertTimes(getDailyRecapTime());
+      if (parsed.length === 0) return;
+      time = parsed[0]!;
+    } catch (err) {
+      console.error(`[recap] Invalid DAILY_RECAP_TIME (${getDailyRecapTime()}): ${(err as Error).message} — daily recap disabled.`);
+      return;
+    }
+
+    this.scheduleNextRecap(time);
+  }
+
+  private scheduleNextRecap(time: TrendTime): void {
+    const delay = msUntilNext(time);
+    this.recapTimer = setTimeout(() => {
+      void this.runRecap();
+      this.scheduleNextRecap(time); // same time tomorrow, recomputed so DST doesn't drift it
+    }, delay);
+  }
+
+  /**
+   * Builds and emits the overnight recap, then resets the per-window
+   * counters so the next recap covers only the next window. Charts are
+   * rendered locally (src/chart/) and capped so a large watchlist can't
+   * produce a 20-image post.
+   */
+  private async runRecap(): Promise<void> {
+    if (!this.onRecap) return;
+
+    try {
+      const ethUsdRate = await openseaClient.getEthUsdRate();
+      const inputs = this.collections.map((collectionId) => {
+        const entry = this.watchlistConfig.entries.find((e) => e.collection.toLowerCase() === collectionId.toLowerCase());
+        const samples = this.historyStore.getSince(collectionId, RECAP_WINDOW_HOURS);
+        return {
+          collectionId,
+          label: entry?.label ?? this.state.get(collectionId)?.lastFloorName ?? collectionId,
+          currency: "ETH",
+          samples,
+          counters: this.recapCounters.get(collectionId) ?? emptyCounters(),
+        };
+      });
+
+      const summary = buildRecapSummary(inputs, RECAP_WINDOW_HOURS, new Date(), ethUsdRate);
+      const charts = this.renderChartsFor(inputs, `past ${RECAP_WINDOW_HOURS}h`, MAX_RECAP_CHARTS);
+
+      await this.onRecap(summary, charts);
+      this.lastRecapAt = new Date().toISOString();
+      this.recapCounters.clear();
+    } catch (err) {
+      console.error(`[recap] failed to build/post the daily recap: ${(err as Error).message}`);
+    }
+  }
+
+  /** Renders up to `limit` charts, skipping collections without enough history. Never throws — a chart failure degrades to a text-only post. */
+  private renderChartsFor(
+    inputs: Array<{ collectionId: string; label: string; currency: string; samples: FloorSample[] }>,
+    windowLabel: string,
+    limit: number,
+  ): Array<{ label: string; png: Buffer }> {
+    if (!config.TREND_CHARTS_ENABLED) return [];
+
+    const charts: Array<{ label: string; png: Buffer }> = [];
+    for (const input of inputs) {
+      if (charts.length >= limit) break;
+      try {
+        const png = renderFloorChart({
+          collectionName: input.label,
+          currency: input.currency,
+          samples: input.samples,
+          windowLabel,
+        });
+        if (png) charts.push({ label: input.label, png });
+      } catch (err) {
+        console.warn(`[chart] failed to render chart for ${input.label}: ${(err as Error).message}`);
+      }
+    }
+    return charts;
   }
 
   private scheduleNextTrendCheck(time: TrendTime): void {
@@ -666,7 +1006,7 @@ export class BidLeadMonitor {
 
   /** Fetches a fresh floor for every allowlisted collection and alerts on moves since the previous scheduled check — never on every poll tick. */
   private async runTrendCheck(): Promise<void> {
-    if (!this.onTrendAlert) return;
+    if (!this.onTrendAlert && !this.onTrendAlertWithChart) return;
 
     this.lastTrendCheckAt = new Date().toISOString();
     await Promise.all(
@@ -679,7 +1019,7 @@ export class BidLeadMonitor {
           if (prevFloor === undefined || prevFloor === 0) return; // first check just seeds the baseline
 
           const change = (floor.floorPriceNative - prevFloor) / prevFloor;
-          if (Math.abs(change) < config.FLOOR_MOVE_THRESHOLD) return;
+          if (Math.abs(change) < getFloorMoveThreshold()) return;
 
           const direction = change > 0 ? "up" : "down";
           const [collectionImage, topCollectionOfferNative, ethUsdRate] = await Promise.all([
@@ -694,7 +1034,7 @@ export class BidLeadMonitor {
           const prevFloorText = formatPriceWithUsd(prevFloor, floor.floorPriceCurrency, { ethUsdRate });
           const newFloorText = formatPriceWithUsd(floor.floorPriceNative, floor.floorPriceCurrency, { ethUsdRate });
 
-          await this.onTrendAlert!({
+          const alert: Alert = {
             title: `Floor price moved ${direction} — ${floor.name}`,
             message: `${floor.name} floor moved ${(change * 100).toFixed(1)}% from ${prevFloorText} to ${newFloorText} (twice-daily check).${topOfferText}`,
             severity: "warning",
@@ -707,7 +1047,26 @@ export class BidLeadMonitor {
             },
             kind: "floor-move",
             thumbnailUrl: collectionImage?.imageUrl ?? undefined,
-          });
+          };
+
+          if (this.onTrendAlertWithChart) {
+            const entry = this.watchlistConfig.entries.find((e) => e.collection.toLowerCase() === collectionId.toLowerCase());
+            const [chart] = this.renderChartsFor(
+              [
+                {
+                  collectionId,
+                  label: entry?.label ?? floor.name,
+                  currency: floor.floorPriceCurrency,
+                  samples: this.historyStore.getSince(collectionId, TREND_CHART_WINDOW_HOURS),
+                },
+              ],
+              `past ${TREND_CHART_WINDOW_HOURS}h`,
+              1,
+            );
+            await this.onTrendAlertWithChart(alert, chart);
+          } else {
+            await this.onTrendAlert!(alert);
+          }
         } catch (err) {
           console.error(`[trend-alert] failed to check floor for ${collectionId}: ${(err as Error).message}`);
         }

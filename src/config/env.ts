@@ -52,6 +52,10 @@ const envSchema = z.object({
   DISCORD_AUDIT_LOG_CHANNEL_ID: z.string().optional().default(""),
   DISCORD_STATUS_CHANNEL_ID: z.string().optional().default(""),
   DISCORD_SALES_CHANNEL_ID: z.string().optional().default(""),
+  /** Whale wallet activity (Group 3). Falls back to the bid-leads channel when unset. */
+  DISCORD_WHALE_CHANNEL_ID: z.string().optional().default(""),
+  /** Once-daily overnight recap + the twice-daily trend digest's chart. Falls back to the trend-alerts channel when unset. */
+  DISCORD_RECAP_CHANNEL_ID: z.string().optional().default(""),
   /** The only Discord user ID whose reactions on bid-lead messages, and whose slash-command invocations, are honored. */
   DISCORD_AUTHORIZED_USER_ID: z.string().optional().default(""),
   /** Optional: pin slash-command registration to one guild ID. If unset, commands register in every guild the bot is currently in. */
@@ -94,6 +98,33 @@ const envSchema = z.object({
 
   /** Budget for OpenSeaClient's request scheduler (src/opensea/requestScheduler.ts) — every OpenSea API call is queued and paced against this. Default 50/min, safely under the free-tier ~60/min cap; lower it if you're still seeing 429s, raise it if you have a higher-limit key. */
   OPENSEA_REQUESTS_PER_MINUTE: numberFromString(50),
+
+  /** Local 24h time (HH:MM) the once-daily overnight recap posts at. Separate from TREND_ALERT_TIMES — this one summarizes the whole night across every watched collection. */
+  DAILY_RECAP_TIME: z.string().default("07:00"),
+
+  /** Attach a locally-rendered floor/volume PNG chart to the trend digest + daily recap. Rendered in-process with no native dependencies (see src/chart/). Default-safe: anything but explicit "false" leaves it on. */
+  TREND_CHARTS_ENABLED: z
+    .string()
+    .optional()
+    .default("true")
+    .transform((v) => v.trim().toLowerCase() !== "false"),
+
+  /**
+   * READ-ONLY portfolio tracking (Group 3.5). The ENS name whose PUBLIC
+   * address is resolved and tracked. Resolution is one read-only eth_call;
+   * no key, no wallet connection, no ability to sign or spend — see
+   * src/portfolio/portfolio.ts.
+   */
+  PORTFOLIO_ENS_NAME: z.string().optional().default("neworc.eth"),
+  /** Optional explicit 0x address, skipping ENS resolution entirely. Still strictly read-only. */
+  PORTFOLIO_ADDRESS: z.string().optional().default(""),
+  /**
+   * Comma-separated Ethereum JSON-RPC endpoints, tried in order, used ONLY
+   * for read-only `eth_call` ENS resolution. RPC_URL (if set) is tried
+   * first. Note: cloudflare-eth.com is deliberately NOT a default — it
+   * returns "Internal error" for ENS resolver calls as of this writing.
+   */
+  ETH_RPC_URLS: z.string().default("https://ethereum-rpc.publicnode.com,https://rpc.mevblocker.io,https://eth.merkle.io"),
 });
 
 export type AppConfig = z.infer<typeof envSchema> & {
@@ -101,6 +132,8 @@ export type AppConfig = z.infer<typeof envSchema> & {
   discordEnabled: boolean;
   discordBotEnabled: boolean;
   emailEnabled: boolean;
+  /** Ordered, de-duplicated read-only JSON-RPC endpoints for ENS resolution (RPC_URL first, if set). */
+  ethRpcUrls: string[];
 };
 
 function loadConfig(): AppConfig {
@@ -115,8 +148,17 @@ function loadConfig(): AppConfig {
 
   const data = parsed.data;
 
+  const ethRpcUrls = [
+    ...new Set(
+      [data.RPC_URL, ...data.ETH_RPC_URLS.split(",")]
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
+    ),
+  ];
+
   return {
     ...data,
+    ethRpcUrls,
     hasOpenSeaKey: data.OPENSEA_API_KEY.length > 0,
     discordEnabled: data.DISCORD_WEBHOOK_URL.length > 0,
     discordBotEnabled: data.DISCORD_BOT_TOKEN.length > 0,
@@ -150,5 +192,8 @@ export function logConfigSummary(): void {
   console.log(`  Sales lookback (new collections): ${config.SALES_LOOKBACK_MINUTES}m`);
   console.log(`  Show USD estimates:   ${config.SHOW_USD ? "enabled" : "disabled"}`);
   console.log(`  OpenSea rate budget:  ${config.OPENSEA_REQUESTS_PER_MINUTE} req/min`);
+  console.log(`  Daily recap time:     ${config.DAILY_RECAP_TIME} (local, once daily)`);
+  console.log(`  Trend charts:         ${config.TREND_CHARTS_ENABLED ? "enabled (rendered locally)" : "disabled"}`);
+  console.log(`  Portfolio (READ-ONLY):${config.PORTFOLIO_ADDRESS || config.PORTFOLIO_ENS_NAME || "(none)"} — public address only, no key, cannot sign or spend`);
   console.log("=====================================");
 }
