@@ -766,6 +766,47 @@ invocation, so it doesn't leak watchlist entry names or live OpenSea data
 to other guild members who can technically type a slash command even
 though they can't run one.
 
+### Listing ladders and price-change noise
+
+OpenSea's `/listings/collection/{slug}/all` returns **every active order**,
+and one token frequently carries many concurrent orders. This is not an edge
+case: Super Punk World #327 was observed live with **12 simultaneous
+listings** laddered from 0.189512 to 0.189623 ETH.
+
+Two problems fell out of that, both now fixed:
+
+**1. The anchor flip-flop.** The anchor store keys on collection+token, so
+feeding it each order in turn made the stored price alternate between rungs
+of the ladder, and every alternation posted a "▼/▲ Price change" describing
+no real movement. `selectLowestListingPerToken`
+(`src/watchlist/lowestListing.ts`) now collapses each tick's listings to
+**one per token — the cheapest active order**, which is both the
+semantically correct price (it's what you'd actually pay) and structurally
+impossible to alternate: there is exactly one price per token per tick.
+
+Posting decisions are consequently driven by *anchor price vs. the token's
+cheapest active listing*, not by order-hash novelty:
+
+| Situation | Result |
+| --- | --- |
+| Anchor matches the cheapest price | Recurrence — thread status updated in place |
+| Anchor exists, price moved ≥ threshold | Genuine price change — reposted, anchor advances |
+| Anchor exists, price moved < threshold | Recurrence — thread updated, **anchor deliberately held** |
+| No anchor, order never seen before | Genuinely new listing — posted |
+| No anchor, order seen at baseline | Silent — pre-existing, so restarts never backfill |
+
+**2. Micro-move noise.** Ladder sellers nudge orders by fractions of a
+percent — real changes, but ~$0.02 ones. `PRICE_CHANGE_MIN_PERCENT`
+(default `1`) is the minimum move required to repost. Sub-threshold drift
+updates the thread instead and **does not advance the anchor**, so a slow
+genuine slide still reports once it accumulates past the threshold. This
+mirrors how `CollectionMonitor` compares against the last *alerted* floor
+rather than the last tick, so narrow oscillation can't retrigger forever.
+
+Measured on the live #327 case: 4 alternating posts per tick before, exactly
+1 after collapsing, and 0 (thread update only) once the ladder's drift fell
+under the threshold — with the anchor stable across consecutive polls.
+
 ### Watching items 👀
 
 Marking a bid lead 👀 (the **Watch** button, or the reaction) adds that
@@ -1332,8 +1373,15 @@ See `.env.example` for the full list with inline documentation:
 `SALES_LOOKBACK_MINUTES`, `SHOW_USD`, `OPENSEA_REQUESTS_PER_MINUTE`, `WATCHLIST_CONFIG_PATH`.
 
 Added for Group 3: `DISCORD_WHALE_CHANNEL_ID`, `DISCORD_RECAP_CHANNEL_ID`,
-`DAILY_RECAP_TIME`, `TREND_CHARTS_ENABLED`, `PORTFOLIO_ENS_NAME`,
-`PORTFOLIO_ADDRESS`, `ETH_RPC_URLS`.
+`DAILY_RECAP_TIME`, `TREND_CHARTS_ENABLED`, `PRICE_CHANGE_MIN_PERCENT`,
+`PORTFOLIO_ENS_NAME`, `PORTFOLIO_ADDRESS`, `ETH_RPC_URLS`.
+
+`WATCHED_COLLECTIONS` entries are validated at load: anything that isn't a
+well-formed EVM address (`0x` + 40 hex digits) is dropped with a single
+one-time warning, rather than being polled and rejected by OpenSea with
+`400 Unrecognized address` on every tick. See
+[Listing ladders](#listing-ladders-and-price-change-noise) for
+`PRICE_CHANGE_MIN_PERCENT`.
 
 Six of these can also be changed live from Discord with `/config set`, which
 persists an override into `watchlist.json`; the `.env` value remains the

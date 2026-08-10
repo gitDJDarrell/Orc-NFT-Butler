@@ -15,15 +15,43 @@ const numberFromString = (fallback: number) =>
       return Number.isFinite(n) ? n : fallback;
     });
 
+/** A well-formed EVM contract address: "0x" + exactly 40 hex digits. */
+const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/** Collected during parsing and reported ONCE at load (see reportMalformedWatchedCollections) rather than from inside the transform, which Zod may run more than once. */
+const malformedWatchedCollections: string[] = [];
+
+/**
+ * Parses a comma-separated address list, dropping anything that isn't a
+ * well-formed EVM address.
+ *
+ * Without this, a truncated or mistyped entry in WATCHED_COLLECTIONS gets
+ * polled every single tick and OpenSea rejects it every single time with
+ * `400 Unrecognized address` — an endless, unactionable error loop in
+ * stderr. (This is not hypothetical: the shipped .env.example defaults were
+ * both one hex digit short, so every copied .env inherited the problem.)
+ *
+ * Dropping them is safe: WATCHED_COLLECTIONS feeds only the legacy
+ * dashboard CollectionMonitor, never the allowlist-only Discord pipeline,
+ * which reads watchlist.json instead. A malformed entry could not have
+ * produced data anyway — the only thing lost is the error spam.
+ */
 const addressListFromString = z
   .string()
   .optional()
-  .transform((v) =>
-    (v ?? "")
+  .transform((v) => {
+    const entries = (v ?? "")
       .split(",")
       .map((s) => s.trim())
-      .filter((s) => s.length > 0),
-  );
+      .filter((s) => s.length > 0);
+
+    const valid: string[] = [];
+    for (const entry of entries) {
+      if (EVM_ADDRESS_RE.test(entry)) valid.push(entry);
+      else if (!malformedWatchedCollections.includes(entry)) malformedWatchedCollections.push(entry);
+    }
+    return valid;
+  });
 
 const envSchema = z.object({
   DRY_RUN: z
@@ -99,6 +127,19 @@ const envSchema = z.object({
   /** Budget for OpenSeaClient's request scheduler (src/opensea/requestScheduler.ts) — every OpenSea API call is queued and paced against this. Default 50/min, safely under the free-tier ~60/min cap; lower it if you're still seeing 429s, raise it if you have a higher-limit key. */
   OPENSEA_REQUESTS_PER_MINUTE: numberFromString(50),
 
+  /**
+   * Minimum percent move in a token's cheapest active listing before a
+   * "Price change" is re-posted to #new-listings. Guards against listing
+   * *ladders*: sellers commonly keep many concurrent orders on one token and
+   * nudge them by fractions of a percent, which is a real price change but a
+   * meaningless one (~$0.02 moves were observed live). Sub-threshold drift
+   * updates the thread's status message instead, and deliberately does NOT
+   * advance the anchor — so slow cumulative drift still reports once it adds
+   * up past the threshold, the same way CollectionMonitor compares against
+   * the last ALERTED floor rather than the last tick.
+   */
+  PRICE_CHANGE_MIN_PERCENT: numberFromString(1),
+
   /** Local 24h time (HH:MM) the once-daily overnight recap posts at. Separate from TREND_ALERT_TIMES — this one summarizes the whole night across every watched collection. */
   DAILY_RECAP_TIME: z.string().default("07:00"),
 
@@ -170,6 +211,37 @@ function loadConfig(): AppConfig {
 
 export const config = loadConfig();
 
+/**
+ * One-time warning for WATCHED_COLLECTIONS entries that were dropped as
+ * malformed. Emitted once at module load — deliberately NOT per poll tick,
+ * which is the whole point of validating here instead of letting OpenSea
+ * reject them forever.
+ */
+function reportMalformedWatchedCollections(): void {
+  if (malformedWatchedCollections.length === 0) return;
+
+  console.warn(
+    `[config] Ignoring ${malformedWatchedCollections.length} malformed WATCHED_COLLECTIONS entr${
+      malformedWatchedCollections.length === 1 ? "y" : "ies"
+    } (an EVM address is "0x" + 40 hex digits):`,
+  );
+  for (const entry of malformedWatchedCollections) {
+    const hexDigits = entry.replace(/^0x/i, "").length;
+    const reason = !/^0x/i.test(entry)
+      ? "missing the 0x prefix"
+      : hexDigits !== 40
+        ? `${hexDigits} hex digits, expected 40 (truncated or over-long)`
+        : "contains non-hex characters";
+    console.warn(`[config]   - ${entry} — ${reason}`);
+  }
+  console.warn(
+    "[config] These are skipped, so no API calls are wasted on them and no `400 Unrecognized address` errors will be logged. " +
+      "Fix or remove them in .env. Note this affects only the legacy dashboard monitor — the Discord bot's allowlist comes from watchlist.json.",
+  );
+}
+
+reportMalformedWatchedCollections();
+
 export function logConfigSummary(): void {
   console.log("=== NFT/DeFi Agent configuration ===");
   console.log(`  DRY_RUN:              ${config.DRY_RUN} ${config.DRY_RUN ? "" : "  <-- LIVE EXECUTION IS NOT IMPLEMENTED, THIS HAS NO EFFECT YET"}`);
@@ -185,7 +257,15 @@ export function logConfigSummary(): void {
   console.log(`  Watchlist config:     ${config.WATCHLIST_CONFIG_PATH}`);
   console.log(`  Poll interval:        ${config.POLL_INTERVAL_SECONDS}s (bid leads + new listings)`);
   console.log(`  Trend alert times:    ${config.TREND_ALERT_TIMES} (local time, twice-daily digest only)`);
-  console.log(`  Watched collections:  ${config.WATCHED_COLLECTIONS.length > 0 ? config.WATCHED_COLLECTIONS.join(", ") : "(none — using demo collections)"}`);
+  console.log(
+    `  Watched collections:  ${
+      config.WATCHED_COLLECTIONS.length > 0
+        ? config.WATCHED_COLLECTIONS.join(", ")
+        : config.hasOpenSeaKey
+          ? "(none valid — legacy dashboard watchlist is empty; Discord uses watchlist.json)"
+          : "(none — using demo collections)"
+    }${malformedWatchedCollections.length > 0 ? `  [${malformedWatchedCollections.length} malformed entr${malformedWatchedCollections.length === 1 ? "y" : "ies"} ignored]` : ""}`,
+  );
   console.log(`  Floor move threshold: ${config.FLOOR_MOVE_THRESHOLD * 100}%`);
   console.log(`  New listing max price:${config.NEW_LISTING_MAX_PRICE}`);
   console.log(`  Above-market offer threshold: +${config.OFFER_ABOVE_COLLECTION_THRESHOLD_PERCENT}% over top collection offer`);

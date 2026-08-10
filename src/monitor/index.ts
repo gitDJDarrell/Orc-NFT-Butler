@@ -83,16 +83,38 @@ export class CollectionMonitor {
 
   constructor(onAlert: AlertHandler, collections?: string[]) {
     this.onAlert = onAlert;
-    this.collections =
-      collections && collections.length > 0
-        ? [...collections]
-        : config.WATCHED_COLLECTIONS.length > 0
-          ? [...config.WATCHED_COLLECTIONS]
-          : openseaClient.defaultWatchedCollections();
+    this.collections = CollectionMonitor.resolveCollections(collections);
 
     for (const id of this.collections) {
       this.state.set(id, freshState());
     }
+  }
+
+  /**
+   * Explicit list -> validated WATCHED_COLLECTIONS -> mock defaults.
+   *
+   * That last fallback is deliberately gated on actually running in mock
+   * mode. The default IDs come from the mock fixture table
+   * (`mockDefaultCollections`), and those identifiers are not real,
+   * resolvable contract addresses — polling them against the LIVE API just
+   * produces a `400 Unrecognized address` on every tick, forever. With a
+   * live key and nothing valid configured, watching nothing is the honest
+   * outcome: the dashboard shows an empty watchlist instead of a permanent
+   * error loop. (Malformed WATCHED_COLLECTIONS entries are dropped during
+   * config load — see src/config/env.ts.)
+   */
+  private static resolveCollections(explicit?: string[]): string[] {
+    if (explicit && explicit.length > 0) return [...explicit];
+    if (config.WATCHED_COLLECTIONS.length > 0) return [...config.WATCHED_COLLECTIONS];
+
+    if (openseaClient.usingMockData) return openseaClient.defaultWatchedCollections();
+
+    console.warn(
+      "[monitor] No valid WATCHED_COLLECTIONS configured and a live OpenSea key is present — the dashboard watchlist will be empty. " +
+        "Not falling back to the mock demo collections, whose IDs are fixtures rather than real addresses and would fail every poll. " +
+        "Note this does not affect the Discord bot, whose allowlist comes from watchlist.json.",
+    );
+    return [];
   }
 
   /** The collection IDs this monitor is watching. */

@@ -16,6 +16,7 @@ import { renderFloorChart } from "../chart/floorChart.js";
 import { FloorHistoryStore, type FloorSample } from "./historyStore.js";
 import { ListingAnchorStore } from "./listingAnchorStore.js";
 import { LeadLimiter } from "./limiter.js";
+import { selectLowestListingPerToken } from "./lowestListing.js";
 import { buildRecapSummary, emptyCounters, type RecapCounters, type RecapSummary } from "./recap.js";
 import { SeenStore } from "./seenStore.js";
 import { getAllowlistedCollectionIds, loadWatchlistConfig } from "./store.js";
@@ -496,18 +497,16 @@ export class BidLeadMonitor {
       const isBaselinePoll = this.seenStore.isNewCollection(collectionId);
       const saleLookbackCutoffMs = Date.now() - config.SALES_LOOKBACK_MINUTES * 60_000;
 
-      // A listing whose order hash we've already processed before is
-      // definitely still active/unsold at the same price — a cheap,
-      // reliable "definitely a recurrence" signal. It is NOT, however, the
-      // only way a recurrence shows up: OpenSea sometimes reissues a fresh
-      // order hash for a token that's still listed at the SAME price (a
-      // relist/renewal, not a real event) — confirmed live, this is not
-      // theoretical. Those arrive with a brand-new order hash, so they land
-      // in `newListings` below, where a second check (against the anchor
-      // store's recorded price) catches them before they'd otherwise be
-      // misreported as a fresh "New listing" post.
-      const newListings = isBaselinePoll ? [] : listings.filter((l) => !state.seenListingIds.has(l.id));
-      const recurringListings = isBaselinePoll ? [] : listings.filter((l) => state.seenListingIds.has(l.id));
+      // One token can carry SEVERAL concurrent orders at near-identical
+      // prices, so decisions are made per TOKEN against its cheapest active
+      // listing — never per order hash, which is what used to make the
+      // anchor alternate between two prices and emit an endless ▼/▲
+      // "Price change" flip-flop. See lowestListing.ts.
+      const activeListings = selectLowestListingPerToken(listings);
+
+      // Every observed order hash is still recorded (not just the cheapest),
+      // so restart-safety and the baseline check see the full picture.
+      const alreadySeen = new Set(state.seenListingIds);
       for (const listing of listings) state.seenListingIds.add(listing.id);
       if (state.seenListingIds.size > 1000) state.seenListingIds.clear();
 
@@ -528,37 +527,66 @@ export class BidLeadMonitor {
 
       // Whale scan reads the SAME listings/sales already in hand — strictly
       // allowlist-scoped by construction, and zero additional API calls.
-      await this.checkWhaleActivity(collectionId, floor.name, newListings, newSales, ethUsdRate);
+      // Listings are the ones whose order hash we've genuinely never seen
+      // (empty on a baseline poll, so a restart never replays old whale
+      // listings); whale SALES still flow on a baseline poll, bounded by the
+      // same SALES_LOOKBACK_MINUTES window as regular sales.
+      const newlySeenListings = isBaselinePoll ? [] : activeListings.filter((l) => !alreadySeen.has(l.id));
+      await this.checkWhaleActivity(collectionId, floor.name, newlySeenListings, newSales, ethUsdRate);
 
-      for (const listing of recurringListings) {
+      if (isBaselinePoll) return; // first-ever poll only establishes the seen baseline — never posts
+
+      // Classify each token by comparing its CHEAPEST active listing against
+      // the anchor we have on record for it:
+      //   - anchor matches that price   -> recurrence (thread status update)
+      //   - anchor exists, price moved  -> genuine price change (repost)
+      //   - no anchor, order never seen -> genuinely new listing
+      //   - no anchor, order seen befor -> pre-existing at baseline; stays
+      //     silent, so a restart never backfills.
+      const recurrences: ListingInfo[] = [];
+      const actionable: ListingInfo[] = [];
+
+      for (const listing of activeListings) {
+        const anchor = this.listingAnchorStore.get(listing.collectionId, listing.tokenId);
+
+        if (anchor) {
+          const sameCurrency = anchor.priceCurrency === listing.priceCurrency;
+          const movePercent =
+            sameCurrency && anchor.price > 0 ? Math.abs((listing.priceNative - anchor.price) / anchor.price) * 100 : Number.POSITIVE_INFINITY;
+
+          // Unchanged, or a sub-threshold nudge from a listing ladder:
+          // refresh the thread status but don't repost, and leave the anchor
+          // where it is so cumulative drift still reports eventually.
+          if (anchor.price === listing.priceNative && sameCurrency) recurrences.push(listing);
+          else if (movePercent < config.PRICE_CHANGE_MIN_PERCENT) recurrences.push(listing);
+          else actionable.push(listing);
+          continue;
+        }
+
+        // No anchor: only a listing we've genuinely never seen is news. One
+        // we saw during the baseline poll (or before an outage) is
+        // pre-existing and must stay silent.
+        if (!alreadySeen.has(listing.id)) actionable.push(listing);
+      }
+
+      for (const listing of recurrences) {
         const { imageUrl } = await openseaClient.getNftDetails(listing.collectionId, listing.tokenId);
         await this.emitListingRecurrence(listing, floor.name, imageUrl, ethUsdRate);
       }
 
       // Only spend the extra collection-offers read when there's actually
-      // something new this tick to compare against it.
-      const topCollectionOfferNative =
-        newListings.length > 0 ? await this.getTopCollectionOfferPrice(collectionId) : undefined;
+      // something actionable this tick to compare against it.
+      const topCollectionOfferNative = actionable.length > 0 ? await this.getTopCollectionOfferPrice(collectionId) : undefined;
 
-      for (const listing of newListings) {
+      for (const listing of actionable) {
         const [{ imageUrl, traits }, lastSale] = await Promise.all([
           openseaClient.getNftDetails(listing.collectionId, listing.tokenId),
           openseaClient.getLastSaleForToken(listing.collectionId, listing.tokenId),
         ]);
 
-        // A brand-new order hash for a token that already has an anchor at
-        // the SAME price is a relist/renewal, not a real new event or a
-        // price change — thread it like any other recurrence instead of
-        // posting (and misreporting) a fresh "New listing".
-        const existingAnchor = this.listingAnchorStore.get(listing.collectionId, listing.tokenId);
-        if (existingAnchor && existingAnchor.price === listing.priceNative && existingAnchor.priceCurrency === listing.priceCurrency) {
-          await this.emitListingRecurrence(listing, floor.name, imageUrl, ethUsdRate);
-          continue;
-        }
-
         await this.emitNewListing(listing, floor, imageUrl, ethUsdRate);
 
-        const candidate = this.buildCandidate(listing, floor, floorMovePercent, newListings.length, imageUrl, traits, ethUsdRate, lastSale);
+        const candidate = this.buildCandidate(listing, floor, floorMovePercent, actionable.length, imageUrl, traits, ethUsdRate, lastSale);
         const match = evaluateCandidate(candidate, this.watchlistConfig, this.limiter);
         if (match) {
           await this.onLead(match, candidate);
@@ -659,7 +687,11 @@ export class BidLeadMonitor {
 
     const anchor = this.listingAnchorStore.get(listing.collectionId, listing.tokenId);
     if (!anchor) return;
-    if (anchor.price !== listing.priceNative || anchor.priceCurrency !== listing.priceCurrency) return; // defensive — shouldn't happen, see pollCollection's comment
+    // NOTE: the listing's price may legitimately differ slightly from the
+    // anchor's — a sub-PRICE_CHANGE_MIN_PERCENT ladder nudge is routed here
+    // rather than reposted (see pollCollection). The status embed renders
+    // the CURRENT price, so the thread stays accurate while the anchor
+    // deliberately lags at the last *reported* price.
 
     const seenCount = (anchor.seenCount ?? 1) + 1;
     const lastSeenAt = new Date().toISOString();
