@@ -1256,6 +1256,36 @@ avoiding `0x80070005`:
   only needs its own project directory and outbound HTTPS, so it never asks
   for admin, and no password is ever stored.
 
+### The watchdog and "incorrectly formatted or out of range" (0x80041318)
+
+A separate failure mode, on the watchdog task specifically:
+
+```
+Register-ScheduledTask : The task XML contains a value which is incorrectly
+formatted or out of range. (8,42):Duration:P99999999DT23H59M59S
+HRESULT 0x80041318
+```
+
+`P99999999DT23H59M59S` is `[TimeSpan]::MaxValue`. Passing it as
+`-RepetitionDuration` to express "repeat forever" is a common idiom, but Task
+Scheduler rejects the value outright.
+
+The correct way to say "indefinitely" is to **omit the duration entirely**:
+
+```powershell
+# right — repeats forever
+New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+
+# wrong — serializes to P99999999DT23H59M59S and is rejected
+... -RepetitionDuration ([TimeSpan]::MaxValue)
+```
+
+Omitting it leaves `Repetition.Duration` empty, which *is* the indefinite
+form. A large finite value like `P3650D` is accepted but isn't truly
+indefinite — it silently stops repeating when it elapses. In the raw-XML
+fallback the equivalent is a `<Repetition>` block with `<Interval>PT5M</Interval>`
+and **no** `<Duration>` element.
+
 If `Register-ScheduledTask` still fails, the script automatically retries via
 `schtasks.exe /Create /XML`, which takes a different code path and sometimes
 succeeds where the CIM-backed cmdlet does not. Each task is registered

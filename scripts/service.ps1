@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Manage the Orc Butler bot as a durable Windows Task Scheduler-backed
   background service: install / start / stop / status / uninstall.
@@ -222,6 +222,13 @@ function Register-BotTask {
 
     $errors = @()
 
+    # Idempotent by design: -Force (cmdlet) and /F (schtasks) both overwrite
+    # an existing definition rather than erroring, so re-running install is
+    # always safe and picks up any changes to the action or trigger. Recorded
+    # up front only so the summary can say "updated" instead of "registered".
+    $existed = $null -ne (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+    $verb = if ($existed) { "updated" } else { "registered" }
+
     # --- Attempt 1: the PowerShell cmdlet ---
     try {
         if ($TriggerKind -eq "Logon") {
@@ -231,9 +238,33 @@ function Register-BotTask {
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
         }
         else {
-            # A long finite duration rather than [TimeSpan]::MaxValue, which
-            # Windows PowerShell 5.1 does not serialize reliably.
-            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+            # -RepetitionDuration is deliberately OMITTED, which is what
+            # actually means "repeat indefinitely".
+            #
+            # Do NOT pass [TimeSpan]::MaxValue here. It serializes to
+            # P99999999DT23H59M59S, which Task Scheduler rejects outright:
+            #   The task XML contains a value which is incorrectly formatted
+            #   or out of range. (8,42):Duration:P99999999DT23H59M59S
+            #   HRESULT 0x80041318
+            # That is the exact failure this watchdog hit. A large finite
+            # duration (e.g. P3650D) is accepted but is not truly indefinite
+            # - it silently stops repeating when it elapses.
+            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+
+            # Defensive: this bug cost a failed install once already, so never
+            # hand Task Scheduler a Duration we haven't confirmed is sane,
+            # even if a future PowerShell build starts populating one. An
+            # empty Duration is the indefinite form.
+            if ($null -ne $trigger.Repetition -and -not [string]::IsNullOrEmpty($trigger.Repetition.Duration)) {
+                $isSane = $false
+                try {
+                    $isSane = [System.Xml.XmlConvert]::ToTimeSpan($trigger.Repetition.Duration).TotalDays -le 3650
+                }
+                catch {
+                    $isSane = $false # unparseable is definitely not sane
+                }
+                if (-not $isSane) { $trigger.Repetition.Duration = "" }
+            }
         }
 
         $registerArgs = @{
@@ -247,7 +278,7 @@ function Register-BotTask {
             ErrorAction = "Stop"
         }
         Register-ScheduledTask @registerArgs | Out-Null
-        return [pscustomobject]@{ Name = $TaskName; Ok = $true; Method = "Register-ScheduledTask"; Errors = @() }
+        return [pscustomobject]@{ Name = $TaskName; Ok = $true; Method = "Register-ScheduledTask"; Verb = $verb; Errors = @() }
     }
     catch {
         $errors += "Register-ScheduledTask: $($_.Exception.Message.Trim())"
@@ -265,13 +296,13 @@ function Register-BotTask {
         # task never stores a password.
         $output = & schtasks.exe /Create /TN $TaskName /XML $xmlPath /F 2>&1
         if ($LASTEXITCODE -eq 0) {
-            return [pscustomobject]@{ Name = $TaskName; Ok = $true; Method = "schtasks /XML"; Errors = $errors }
+            return [pscustomobject]@{ Name = $TaskName; Ok = $true; Method = "schtasks /XML"; Verb = $verb; Errors = $errors }
         }
         $errors += "schtasks /XML: $($output -join ' ')".Trim()
 
         $output = & schtasks.exe /Create /TN $TaskName /XML $xmlPath /RU $UserId /F 2>&1
         if ($LASTEXITCODE -eq 0) {
-            return [pscustomobject]@{ Name = $TaskName; Ok = $true; Method = "schtasks /XML /RU"; Errors = $errors }
+            return [pscustomobject]@{ Name = $TaskName; Ok = $true; Method = "schtasks /XML /RU"; Verb = $verb; Errors = $errors }
         }
         $errors += "schtasks /XML /RU: $($output -join ' ')".Trim()
     }
@@ -282,7 +313,7 @@ function Register-BotTask {
         Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
     }
 
-    return [pscustomobject]@{ Name = $TaskName; Ok = $false; Method = $null; Errors = $errors }
+    return [pscustomobject]@{ Name = $TaskName; Ok = $false; Method = $null; Verb = $verb; Errors = $errors }
 }
 
 function Install-BotTasks {
@@ -335,13 +366,13 @@ function Install-BotTasks {
     Write-Host ""
     foreach ($r in $results) {
         if ($r.Ok) {
-            Write-Host "[service] OK      '$($r.Name)' registered via $($r.Method)."
+            Write-Host "[service] OK      '$($r.Name)' $($r.Verb) via $($r.Method)."
             if ($r.Errors.Count -gt 0) {
                 Write-Host "[service]           (first attempt failed, fallback succeeded: $($r.Errors[0]))"
             }
         }
         else {
-            Write-Host "[service] FAILED  '$($r.Name)' could not be registered:" -ForegroundColor Red
+            Write-Host "[service] FAILED  '$($r.Name)' could not be $($r.Verb):" -ForegroundColor Red
             foreach ($e in $r.Errors) { Write-Host "[service]           - $e" -ForegroundColor Red }
         }
     }
