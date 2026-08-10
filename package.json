@@ -1,5 +1,5 @@
 {
-  "name": "nft-defi-agent",
+  "name": "orc-nft-butler",
   "version": "0.1.0",
   "description": "Custom NFT and DeFi agent: OpenSea-powered monitoring, notifications, and dry-run order building for EVM NFT marketplaces.",
   "private": true,
