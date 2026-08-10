@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NFT/DeFi Agent Dashboard</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>NFT/DeFi Agent</h1>
+    <div id="status-badges" class="badges">Loading status…</div>
+  </header>
+
+  <main class="layout">
+    <section class="panel" id="panel-watchlist">
+      <h2>Watchlist</h2>
+      <form id="add-collection-form" class="inline-form">
+        <input type="text" id="add-collection-input" placeholder="Collection contract address (0x…)" required />
+        <button type="submit">Add</button>
+      </form>
+      <div id="watchlist-error" class="error-text"></div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Collection</th>
+            <th>Floor</th>
+            <th>24h change</th>
+            <th>Updated</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="watchlist-body">
+          <tr><td colspan="5" class="muted">Loading…</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="panel-alerts">
+      <h2>Alerts feed</h2>
+      <div id="alerts-connection" class="muted small">Connecting…</div>
+      <ul id="alerts-list" class="alerts-list">
+        <li class="muted">No alerts yet.</li>
+      </ul>
+    </section>
+
+    <section class="panel" id="panel-order">
+      <h2>Order form <span class="dry-run-tag">DRY-RUN ONLY</span></h2>
+      <form id="order-form">
+        <label>
+          Collection
+          <input type="text" id="order-collection" placeholder="0x… contract address" required />
+        </label>
+        <label>
+          Action
+          <select id="order-action">
+            <option value="buy">Buy</option>
+            <option value="list">List</option>
+            <option value="bid">Bid</option>
+            <option value="acceptOffer">Accept offer</option>
+          </select>
+        </label>
+        <label id="order-tokenid-label">
+          Token ID
+          <input type="text" id="order-tokenid" placeholder="e.g. 1234" />
+        </label>
+        <label id="order-price-label">
+          Price (native currency)
+          <input type="number" id="order-price" step="0.0001" min="0" placeholder="e.g. 1.5" />
+        </label>
+        <label id="order-offerid-label" class="hidden">
+          Offer ID
+          <input type="text" id="order-offerid" placeholder="offer id to accept" />
+        </label>
+        <button type="submit">Submit (dry-run)</button>
+      </form>
+      <div id="order-result" class="order-result"></div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

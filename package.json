@@ -1,0 +1,39 @@
+{
+  "name": "nft-defi-agent",
+  "version": "0.1.0",
+  "description": "Custom NFT and DeFi agent: OpenSea-powered monitoring, notifications, and dry-run order building for EVM NFT marketplaces.",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dashboard": "tsx watch src/dashboard/server.ts",
+    "setup-server": "tsx src/scripts/setup-server.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "tsx --test src/watchlist/limiter.test.ts src/watchlist/evaluate.test.ts src/watchlist/leadMonitor.test.ts src/watchlist/mutate.test.ts src/watchlist/seenStore.test.ts src/watchlist/listingAnchorStore.test.ts src/watchlist/resolveInput.test.ts src/discord-bot/reactionRouter.test.ts src/discord-bot/embeds.test.ts src/discord-bot/commandRouter.test.ts src/opensea/client.test.ts src/opensea/requestScheduler.test.ts",
+    "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/service.ps1 -Action install",
+    "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/service.ps1 -Action start",
+    "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/service.ps1 -Action stop",
+    "service:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/service.ps1 -Action status",
+    "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/service.ps1 -Action uninstall"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "nodemailer": "^9.0.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.10",
+    "@types/nodemailer": "^6.4.15",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.3"
+  }
+}
