@@ -1174,7 +1174,25 @@ Two scheduled tasks, both created by `scripts/service.ps1`:
 | `OrcButlerBot` | At logon | Primary launcher. Restart-on-failure: up to 999 retries, every 1 minute. No execution time limit (a scheduled task's default 3-day limit would otherwise silently kill a long-running bot). |
 | `OrcButlerBot-Watchdog` | Every 5 minutes, forever | Safety net for the rare case the primary task's own restart-on-failure doesn't catch a death (e.g. it hit its retry cap, or got disabled). Almost always a no-op — see below. |
 
-Both tasks run `scripts\run-bot.ps1`, which:
+Both tasks run `wscript.exe scripts\run-hidden.vbs`, a three-line wrapper
+whose only job is to start `run-bot.ps1` **without ever painting a window**.
+
+Why it exists: `powershell.exe` is a CONSOLE-subsystem binary, so Windows
+allocates and briefly paints a console window *at process creation* — before
+PowerShell has run and can honor `-WindowStyle Hidden`. The result is a
+console that flashes on screen for a fraction of a second on every launch,
+which the 5-minute watchdog turns into a pop-up 288 times a day.
+`wscript.exe` is GUI-subsystem and never allocates a console, so launching
+PowerShell from it with window style `0` means the console is created
+already-hidden and nothing is ever drawn. (`conhost.exe --headless` also
+works but is Windows 11+ only; this approach works everywhere.)
+
+The wrapper waits for the bot to exit rather than firing and forgetting, so
+the task's lifetime still tracks the bot's — `Stop-ScheduledTask`, the
+`State=Running` display, and `MultipleInstances=IgnoreNew` all keep working
+— and it propagates node's exit code so restart-on-failure is unaffected.
+
+`run-bot.ps1` itself is unchanged and still:
 - Resolves the project root from its own location and sets it as the
   working directory (the app loads `.env` via `dotenv/config`, which
   resolves relative to cwd).

@@ -64,6 +64,13 @@ $AllTaskNames = @($TaskNameLogon, $TaskNameWatchdog)
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $RunnerPath = Join-Path $PSScriptRoot "run-bot.ps1"
+# Tasks launch the VBS wrapper rather than powershell.exe directly.
+# powershell.exe is a CONSOLE-subsystem binary, so Windows allocates (and
+# briefly paints) a console window before -WindowStyle Hidden can take
+# effect -- a visible flash on every run, which the 5-minute watchdog turns
+# into a constant pop-up. wscript.exe is GUI-subsystem and never allocates
+# one. See scripts/run-hidden.vbs.
+$HiddenLauncherPath = Join-Path $PSScriptRoot "run-hidden.vbs"
 $LockFile = Join-Path $ProjectRoot ".bot.lock"
 
 function Get-LockedProcessId {
@@ -128,7 +135,7 @@ function New-BotTaskXml {
 
     $safeUser = ConvertTo-XmlText $UserId
     $safeDesc = ConvertTo-XmlText $Description
-    $safeArgs = ConvertTo-XmlText "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerPath`""
+    $safeArgs = ConvertTo-XmlText "`"$HiddenLauncherPath`""
     $safeCwd = ConvertTo-XmlText $ProjectRoot
 
     if ($TriggerKind -eq "Logon") {
@@ -193,7 +200,7 @@ $trigger
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>powershell.exe</Command>
+      <Command>wscript.exe</Command>
       <Arguments>$safeArgs</Arguments>
       <WorkingDirectory>$safeCwd</WorkingDirectory>
     </Exec>
@@ -333,7 +340,14 @@ function Install-BotTasks {
         Write-Host ""
     }
 
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerPath`"" -WorkingDirectory $ProjectRoot
+    if (-not (Test-Path $HiddenLauncherPath)) {
+        Write-Host "[service] Missing $HiddenLauncherPath - cannot register a no-flash task. Restore scripts/run-hidden.vbs and re-run." -ForegroundColor Red
+        exit 1
+    }
+
+    # wscript.exe (GUI subsystem) -> run-hidden.vbs -> powershell -> run-bot.ps1
+    # -> node. Nothing in that chain ever paints a window.
+    $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$HiddenLauncherPath`"" -WorkingDirectory $ProjectRoot
 
     # Least privilege, deliberately:
     #   Interactive     -> runs only while this user is logged on; no stored
