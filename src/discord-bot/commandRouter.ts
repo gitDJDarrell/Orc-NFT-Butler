@@ -12,6 +12,7 @@ import { findWatchlistNameMatch, suggestClosestWatchlistEntry } from "../watchli
 import type { AllowlistEntry } from "../watchlist/schema.js";
 import type { WatchedItem } from "../watchlist/watchStore.js";
 import type { WhaleWallet } from "../watchlist/whaleStore.js";
+import { isHintValue } from "./traitAutocomplete.js";
 import {
   buildAddPreviewEmbed,
   buildConfigEmbed,
@@ -266,6 +267,19 @@ async function handleWatchlist(deps: CommandRouterDeps, invocation: CommandInvoc
 async function handleCreateRule(deps: CommandRouterDeps, invocation: CommandInvocation, input: string): Promise<CommandReply> {
   if (!invocation.condition) {
     return { content: "Provide a `condition` (price_below, rarity_top_percent, trait_listed, or trait_floor).", ephemeral: true };
+  }
+
+  // Trait autocomplete emits hint rows ("pick a collection first", "loading…")
+  // so the dropdown is never silently empty. Those are not real traits —
+  // reject them explicitly rather than writing a rule for a trait literally
+  // named after the hint.
+  if (isHintValue(invocation.traitCategory) || isHintValue(invocation.traitValue)) {
+    return {
+      content:
+        "That trait selection was a placeholder from the dropdown, not a real trait. " +
+        "Pick a `collection` first, wait a moment for its traits to load, then choose `trait_category` and `trait_value`.",
+      ephemeral: true,
+    };
   }
 
   const resolution = await resolveCollectionForCommand(deps, input);

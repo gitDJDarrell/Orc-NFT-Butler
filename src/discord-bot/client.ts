@@ -23,6 +23,8 @@ import { describeSettings } from "../config/runtime.js";
 import { buildPortfolioSnapshot, getCachedPortfolioAddress } from "../portfolio/portfolio.js";
 import { planResetGlobalSetting, planSetEntrySetting, planSetGlobalSetting, type PlanResult } from "../watchlist/configMutate.js";
 import { planAddEntry, planCreateLeadRule, planRemoveEntry, type LeadRuleCondition, type LeadRuleParams } from "../watchlist/mutate.js";
+import { findWatchlistNameMatch } from "../watchlist/resolveInput.js";
+import { TraitAutocomplete } from "./traitAutocomplete.js";
 import type { AllowlistConfig } from "../watchlist/schema.js";
 import { loadWatchlistConfig, saveWatchlistConfig } from "../watchlist/store.js";
 import type { WatchedItem } from "../watchlist/watchStore.js";
@@ -179,10 +181,18 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
     try {
       if (focused.name === "collection") {
         choices = await buildCollectionChoices(query);
+        // Warm the trait catalog for whatever is in the collection field, so
+        // the trait dropdowns are usually populated by the time the user
+        // tabs into them. Non-blocking and deduped.
+        traitAutocomplete.prefetch(interaction.options.getString("collection"));
       } else if (focused.name === "trait_category") {
-        choices = await buildTraitCategoryChoices(interaction, query);
+        choices = traitAutocomplete.buildCategoryChoices(interaction.options.getString("collection"), query);
       } else if (focused.name === "trait_value") {
-        choices = await buildTraitValueChoices(interaction, query);
+        choices = traitAutocomplete.buildValueChoices(
+          interaction.options.getString("collection"),
+          interaction.options.getString("trait_category"),
+          query,
+        );
       }
     } catch (err) {
       console.warn(`[discord-bot] Autocomplete choice-building failed for option ${focused.name}: ${(err as Error).message}`);
@@ -246,35 +256,19 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
     return [...watchlistChoices, ...searchChoices].slice(0, 25);
   }
 
-  /** Trait categories for whatever collection is already filled in the same interaction — empty if none is picked yet, or if the live lookup is slow (timeout-guarded, same as collection search). */
-  async function buildTraitCategoryChoices(interaction: AutocompleteInteraction, rawQuery: string): Promise<{ name: string; value: string }[]> {
-    const collectionValue = interaction.options.getString("collection");
-    if (!collectionValue) return [];
-
-    const query = rawQuery.trim().toLowerCase();
-    const categories = await withTimeout(openseaClient.getCollectionTraits(collectionValue), [], AUTOCOMPLETE_NETWORK_TIMEOUT_MS);
-    return categories
-      .filter((c) => c.key.toLowerCase().includes(query))
-      .slice(0, 25)
-      .map((c) => ({ name: c.key, value: c.key }));
-  }
-
-  /** Trait values for whatever collection + trait_category are already filled in the same interaction — empty if either isn't picked yet, or if the live lookup is slow. */
-  async function buildTraitValueChoices(interaction: AutocompleteInteraction, rawQuery: string): Promise<{ name: string; value: string }[]> {
-    const collectionValue = interaction.options.getString("collection");
-    const categoryValue = interaction.options.getString("trait_category");
-    if (!collectionValue || !categoryValue) return [];
-
-    const query = rawQuery.trim().toLowerCase();
-    const categories = await withTimeout(openseaClient.getCollectionTraits(collectionValue), [], AUTOCOMPLETE_NETWORK_TIMEOUT_MS);
-    const category = categories.find((c) => c.key === categoryValue);
-    if (!category) return [];
-
-    return category.values
-      .filter((v) => v.toLowerCase().includes(query))
-      .slice(0, 25)
-      .map((v) => ({ name: v, value: v }));
-  }
+  /**
+   * Trait suggestions are served from a per-collection catalog cached by
+   * TraitAutocomplete — synchronous, no network on the keystroke path. See
+   * traitAutocomplete.ts for why the previous live-fetch-per-keystroke
+   * approach silently produced an empty dropdown.
+   */
+  const traitAutocomplete = new TraitAutocomplete({
+    resolveCollection: (input) => openseaClient.resolveCollection(input),
+    getCollectionTraits: (idOrSlug) => openseaClient.getCollectionTraits(idOrSlug),
+    // Lets a typed watchlist display name ("Super Punk World") resolve to its
+    // stored address, the same order resolveCollectionForCommand uses.
+    findWatchlistCollection: (input) => findWatchlistNameMatch(input, leadMonitor.getEntries())?.collection ?? null,
+  });
 
   /** /watchlist add: mutates watchlist.json on disk and reloads the live BidLeadMonitor, without dropping the gateway connection. */
   function addWatchlistEntry(resolved: ResolvedCollection, floor: CollectionInfo | null): AddWatchlistOutcome {
