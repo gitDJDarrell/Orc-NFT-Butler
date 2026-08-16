@@ -826,26 +826,46 @@ under the threshold — with the anchor stable across consecutive polls.
 ### Highest offers 💰
 
 `#highest-offers` fires when a watched collection's **top offer sets a new
-record high** — not on every offer. "Highest" is the max across **every**
-scope OpenSea reports (collection-wide, trait, and item), because the number
-worth knowing is the best anyone will currently pay for anything in the
-collection.
+record high** — not on every offer.
 
-The embed carries: collection name + image, the offer amount in **ETH and
-USD**, the **offer type** (collection-wide / trait / item, with the token id
-when available), the **offerer** (short `0x…` form, linked to Etherscan), and
-the **delta vs. the previous high** — e.g. *"▲ new high 0.21 WETH, up from
-0.18 (+16.7%)"*.
+**Records are tracked per scope, not as one blended maximum**, because the
+three kinds of offer are not comparable:
 
-The rules, in `decideHighestOffer` (pure and unit-tested):
+| Scope | Means | Image shown | Title |
+| --- | --- | --- | --- |
+| **Item** | Someone will pay X for **one specific token** | **That item's art** | 🎯 `New highest ITEM offer — <Collection> #<tokenId>` |
+| **Trait** | Someone will pay X for **any item with a given trait** ("trait-exclusive") | Collection image | 🏷️ `New highest TRAIT offer — <Collection>` · states `Background = Blue` |
+| **Collection** | Someone will pay X for **any item** in the collection | Collection image | 🌐 `New highest COLLECTION offer — <Collection> (any item)` |
 
-| Situation | Result |
+Each keeps its **own** high-water mark, and **traits are keyed
+individually** — `Background = Blue` and `Fur = Gold` are independent
+markets. A single blended max would let one big item offer permanently mask
+every collection-wide record (and vice versa); with per-scope tracking, a
+0.2 collection-wide record still fires while a 5 ETH item offer stands.
+Multiple scopes can therefore post on the same tick, each stating which scope
+hit a new high and the delta **vs. that scope's own previous high**.
+
+The embed carries: the scope-appropriate image, the offer amount in **ETH and
+USD**, the **scope** (with token id for item offers, `Key = Value` for trait
+offers), the **offerer** (short `0x…`, linked to Etherscan), and the delta —
+e.g. *"▲ new high 0.21 WETH, up from 0.18 (+16.7%)"*.
+
+Item token ids are best-effort: OpenSea expresses them as
+`criteria.encoded_token_ids`, which is only an unambiguous id for a genuine
+single-token offer. Multi-token/range criteria leave it undefined, and the
+embed then omits the token id and falls back to the collection image rather
+than naming one arbitrary token out of a set.
+
+The rules, applied **per scope** in `decideForScope` (pure and unit-tested):
+
+| Situation (within one scope) | Result |
 | --- | --- |
 | No stored record (first run, or newly added collection) | **Baseline silently** — records the current high, posts nothing |
 | Same offer still on top | Nothing — a standing offer must not repost every hour |
-| Strictly higher than the stored high | **Post**, and store the new record |
+| Strictly higher than that scope's stored high | **Post**, and store the new record |
 | Equal to the stored high | Nothing — matching isn't beating |
-| The record-setting offer is no longer active | **Re-baseline silently** to the current high |
+| The record-setting offer is no longer active in that scope | **Re-baseline silently** to the current high |
+| Scope has a stored record but no offers this tick | Untouched — nothing to re-baseline to |
 
 That last rule matters: without it, one outlier offer would raise the bar
 permanently and the channel would go silent forever once it expired. With it,

@@ -5,26 +5,53 @@ import type { HighestOfferRecord } from "./highestOfferStore.js";
  * Pure decision logic for the #highest-offers feed — no I/O, no Discord, no
  * network, so the "is this actually a new record?" rules are directly
  * unit-testable.
+ *
+ * Records are tracked PER SCOPE rather than as one blended maximum, because
+ * the three kinds of offer are not comparable:
+ *
+ *   - collection : anyone will pay X for ANY item in the collection.
+ *   - trait      : anyone will pay X for any item WITH A GIVEN TRAIT —
+ *                  tracked separately per trait, since "Background = Blue"
+ *                  and "Fur = Gold" are independent markets.
+ *   - item       : anyone will pay X for ONE SPECIFIC token.
+ *
+ * A whole-collection offer of 1 ETH and a trait-exclusive offer of 1 ETH say
+ * very different things, and a single blended max would let a big item offer
+ * permanently mask every collection-wide record (and vice versa). Each scope
+ * therefore keeps its own high-water mark and fires its own notification.
  */
 
-/** What the monitor should do with this tick's offers for one collection. */
-export type HighestOfferDecision =
-  /** First time we've ever seen this collection (or its record expired): remember the current high WITHOUT posting. Same no-backfill posture as listings/sales. */
-  | { action: "baseline"; record: HighestOfferRecord; reason: "first-run" | "record-expired" }
-  /** A genuine new record high: post it and store it. */
-  | { action: "post"; record: HighestOfferRecord; previous: HighestOfferRecord }
-  /** Nothing to do — no offers, or the high hasn't been beaten. */
-  | { action: "none"; reason: "no-offers" | "not-a-new-high" | "same-offer" };
+/** Stable key identifying which "market" a record belongs to. */
+export type ScopeKey = string;
+
+export const SCOPE_KEY_COLLECTION = "collection";
+export const SCOPE_KEY_ITEM = "item";
 
 /**
- * Picks the single highest offer across every scope OpenSea reports —
- * collection-wide, trait, and item — since "the highest offer" for a
- * collection is the best number anyone is currently willing to pay for
- * anything in it, regardless of how the offer is scoped.
- *
- * Ties break on the lexicographically smallest order hash so the choice is
- * stable across ticks and can't oscillate between two equal offers (the same
- * class of bug as the listing-ladder flip-flop; see lowestListing.ts).
+ * All item offers share ONE record (the highest offer on any single token in
+ * the collection), while traits are keyed individually — that's the split
+ * the user cares about: "someone raised their bid on a specific token" is
+ * one signal regardless of which token, whereas each trait is its own market.
+ */
+export function scopeKeyFor(offer: CollectionOfferInfo): ScopeKey {
+  if (offer.scope === "trait") {
+    return offer.trait ? `trait:${offer.trait.key}=${offer.trait.value}` : "trait:unspecified";
+  }
+  if (offer.scope === "token") return SCOPE_KEY_ITEM;
+  return SCOPE_KEY_COLLECTION;
+}
+
+/** What the monitor should do for ONE scope of one collection. */
+export type HighestOfferDecision =
+  | { action: "baseline"; scopeKey: ScopeKey; record: HighestOfferRecord; reason: "first-run" | "record-expired" }
+  | { action: "post"; scopeKey: ScopeKey; record: HighestOfferRecord; previous: HighestOfferRecord }
+  | { action: "none"; scopeKey: ScopeKey; reason: "no-offers" | "not-a-new-high" | "same-offer" };
+
+/**
+ * Highest offer within a single already-scoped group. Ties break on the
+ * lexicographically smallest order hash so the choice is stable across ticks
+ * and can't oscillate between two equal offers (same class of bug as the
+ * listing-ladder flip-flop; see lowestListing.ts).
  */
 export function selectHighestOffer(offers: readonly CollectionOfferInfo[]): CollectionOfferInfo | null {
   let best: CollectionOfferInfo | null = null;
@@ -37,69 +64,95 @@ export function selectHighestOffer(offers: readonly CollectionOfferInfo[]): Coll
   return best;
 }
 
-function toRecord(offer: CollectionOfferInfo, now: Date): HighestOfferRecord {
-  const tokenId = extractTokenId(offer);
+/** Buckets a tick's offers by scope key. */
+export function groupOffersByScope(offers: readonly CollectionOfferInfo[]): Map<ScopeKey, CollectionOfferInfo[]> {
+  const grouped = new Map<ScopeKey, CollectionOfferInfo[]>();
+  for (const offer of offers) {
+    const key = scopeKeyFor(offer);
+    const bucket = grouped.get(key);
+    if (bucket) bucket.push(offer);
+    else grouped.set(key, [offer]);
+  }
+  return grouped;
+}
+
+function toRecord(offer: CollectionOfferInfo, scopeKey: ScopeKey, now: Date): HighestOfferRecord {
   return {
     offerId: offer.id,
+    scopeKey,
     priceNative: offer.priceNative,
     priceCurrency: offer.priceCurrency,
     scope: offer.scope,
-    ...(tokenId ? { tokenId } : {}),
+    ...(offer.tokenId ? { tokenId: offer.tokenId } : {}),
+    ...(offer.trait ? { trait: offer.trait } : {}),
     bidder: offer.bidder,
     recordedAt: now.toISOString(),
   };
 }
 
 /**
- * Decides whether this tick's offers represent a new record high.
- *
- * Rules, in order:
- *   1. No usable offers -> nothing.
- *   2. No stored record -> baseline silently (first run for this collection).
- *   3. The offer that set the stored record is NO LONGER among the active
- *      offers -> that record has expired/been cancelled, so re-baseline to
- *      the current high silently rather than posting. Without this, a single
- *      outlier offer would raise the bar permanently and the channel would
- *      go quiet forever once it expired.
- *   4. Same offer still on top -> nothing (dedupe; a standing offer must not
- *      repost every hour).
- *   5. Strictly greater than the stored high -> post.
+ * Decides one scope's outcome. Rules, in order:
+ *   1. No usable offers in this scope -> nothing.
+ *   2. No stored record for this scope -> baseline silently (first run).
+ *   3. The offer that set the record is no longer among THIS scope's active
+ *      offers -> re-baseline silently. Without this a single outlier would
+ *      raise that scope's bar permanently and mute it forever once expired.
+ *   4. Same offer still on top -> nothing (a standing offer must not repost).
+ *   5. Strictly greater -> post.
  *   6. Otherwise -> nothing.
  */
-export function decideHighestOffer(
+export function decideForScope(
+  scopeKey: ScopeKey,
   offers: readonly CollectionOfferInfo[],
   stored: HighestOfferRecord | undefined,
   now: Date = new Date(),
 ): HighestOfferDecision {
   const best = selectHighestOffer(offers);
-  if (!best) return { action: "none", reason: "no-offers" };
+  if (!best) return { action: "none", scopeKey, reason: "no-offers" };
 
-  const record = toRecord(best, now);
+  const record = toRecord(best, scopeKey, now);
 
-  if (!stored) return { action: "baseline", record, reason: "first-run" };
+  if (!stored) return { action: "baseline", scopeKey, record, reason: "first-run" };
+  if (best.id === stored.offerId) return { action: "none", scopeKey, reason: "same-offer" };
 
-  if (best.id === stored.offerId) return { action: "none", reason: "same-offer" };
-
-  const storedStillActive = offers.some((o) => o.id === stored.offerId);
-  if (!storedStillActive) {
-    return { action: "baseline", record, reason: "record-expired" };
+  if (!offers.some((o) => o.id === stored.offerId)) {
+    return { action: "baseline", scopeKey, record, reason: "record-expired" };
   }
 
   if (best.priceNative > stored.priceNative) {
-    return { action: "post", record, previous: stored };
+    return { action: "post", scopeKey, record, previous: stored };
   }
 
-  return { action: "none", reason: "not-a-new-high" };
+  return { action: "none", scopeKey, reason: "not-a-new-high" };
 }
 
 /**
- * Best-effort token id for an item-scoped offer. OpenSea's criteria offers
- * carry `encoded_token_ids` rather than a plain id and the client doesn't
- * decode it, so this is only populated when the mapper already surfaced one.
+ * Runs decideForScope across every scope present in this tick's offers.
+ * Scopes with a stored record but no current offers are left untouched —
+ * there's nothing to re-baseline to, and the record expires naturally the
+ * next time that scope has offers.
  */
-function extractTokenId(offer: CollectionOfferInfo): string | undefined {
-  const candidate = (offer as CollectionOfferInfo & { tokenId?: string }).tokenId;
-  return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+export function decideHighestOffers(
+  offers: readonly CollectionOfferInfo[],
+  storedByScope: Readonly<Record<ScopeKey, HighestOfferRecord>>,
+  now: Date = new Date(),
+): HighestOfferDecision[] {
+  const decisions: HighestOfferDecision[] = [];
+  for (const [scopeKey, group] of groupOffersByScope(offers)) {
+    decisions.push(decideForScope(scopeKey, group, storedByScope[scopeKey], now));
+  }
+  return decisions;
+}
+
+/** Human label for a scope, used in logs and the embed. */
+export function describeScope(record: HighestOfferRecord, collectionName: string): string {
+  if (record.scope === "token") {
+    return record.tokenId ? `Item offer — ${collectionName} #${record.tokenId}` : `Item offer — ${collectionName} (specific token)`;
+  }
+  if (record.scope === "trait") {
+    return record.trait ? `Trait offer — ${collectionName} · ${record.trait.key} = ${record.trait.value}` : `Trait offer — ${collectionName}`;
+  }
+  return `Collection offer — ${collectionName} (any item)`;
 }
 
 /** "▲ up from 0.18 ETH (+16.7%)" — the delta line shown on the embed. */

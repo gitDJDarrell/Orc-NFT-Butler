@@ -577,11 +577,16 @@ function buildCommandsEmbeds(): ReturnType<EmbedBuilder["toJSON"]>[] {
       {
         name: "💰 #highest-offers",
         value:
-          "Posts when a watched collection's **top offer sets a new record high** — the max across collection-wide, trait, and item offers. " +
-          "Shows the amount (ETH + USD), the offer type, the offerer, and the delta vs. the previous high.\n" +
-          "It is NOT a feed of every offer: a standing offer never reposts, and the current high is recorded silently on first run so a restart " +
-          "never replays it as if it were new. If the record-setting offer expires, the bar re-baselines to the current high (silently) so the " +
-          "channel can't be muted forever by one outlier.",
+          "Posts when a watched collection's top offer sets a **new record high** — tracked SEPARATELY for each of the three offer kinds, " +
+          "because they are not equivalent:\n" +
+          "🎯 **Item offer** — on ONE specific token. Shows that item's image and its #tokenId.\n" +
+          "🏷️ **Trait offer** — on ANY item with a given trait (trait-exclusive). Shows the collection image and states the trait, e.g. `Background = Blue`. Each trait is its own record.\n" +
+          "🌐 **Collection offer** — on ANY item in the collection. Shows the collection image.\n" +
+          "Each post says which scope hit a new high and the delta vs. THAT scope's previous high, so a big item offer never masks a " +
+          "collection-wide record.\n" +
+          "It is NOT a feed of every offer: a standing offer never reposts, and every scope's current high is recorded silently on first run so " +
+          "a restart never replays it. If a record-setting offer expires, that scope re-baselines silently so the channel can't be muted forever " +
+          "by one outlier.",
         inline: false,
       },
       {

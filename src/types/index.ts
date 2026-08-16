@@ -64,6 +64,13 @@ export type OfferScope = "collection" | "trait" | "token";
 export interface CollectionOfferInfo extends BidInfo {
   scope: OfferScope;
   trait?: Trait;
+  /**
+   * The specific token an item-scoped offer targets. Best-effort: OpenSea
+   * expresses this as `criteria.encoded_token_ids`, which is only a plain id
+   * for a genuine single-token offer — a multi-token/range criteria offer
+   * leaves this undefined (see opensea/client.ts mapOffer).
+   */
+  tokenId?: string;
 }
 
 /** A completed sale, from OpenSea's collection events endpoint (event_type=sale). */

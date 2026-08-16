@@ -771,8 +771,12 @@ export class OpenSeaClient {
 
   private mapOffer(o: OpenSeaOffer, collectionId: string, forcedScope?: OfferScope): CollectionOfferInfo {
     const hasTraits = Boolean(o.criteria?.traits && o.criteria.traits.length > 0);
-    const hasTokenIds = Boolean(o.criteria?.encoded_token_ids);
-    const scope: OfferScope = forcedScope ?? (hasTraits ? "trait" : hasTokenIds ? "token" : "collection");
+    // `encoded_token_ids` is present on EVERY criteria offer, including
+    // collection-wide ones, where its value is the wildcard "*" meaning "any
+    // token". Treating mere presence as an item offer (as this used to)
+    // misclassified every collection-wide offer as item-scoped — confirmed
+    // live: all offers on the watched collections came back as "*".
+    const scope: OfferScope = forcedScope ?? (hasTraits ? "trait" : targetsSpecificTokens(o.criteria?.encoded_token_ids) ? "token" : "collection");
     const trait = o.criteria?.traits?.[0] ? { key: o.criteria.traits[0].type ?? "trait", value: o.criteria.traits[0].value ?? "" } : undefined;
 
     return {
@@ -785,8 +789,36 @@ export class OpenSeaClient {
       createdAt: o.order_created_at ? new Date(o.order_created_at * 1000).toISOString() : new Date().toISOString(),
       scope,
       trait,
+      tokenId: decodeSingleTokenId(o.criteria?.encoded_token_ids),
     };
   }
+}
+
+/**
+ * Pulls a single token id out of a criteria offer's `encoded_token_ids`.
+ *
+ * OpenSea uses this field for anything narrower than the whole collection:
+ * a genuine single-item offer is just `"1234"`, but the same field also
+ * carries comma lists (`"1,2,3"`) and ranges (`"1:100"`) for multi-token
+ * criteria offers. Only the unambiguous single-id form yields a token id;
+ * anything else returns undefined, so callers fall back to collection-level
+ * display rather than naming one arbitrary token out of a set.
+ */
+export function decodeSingleTokenId(encoded: string | undefined): string | undefined {
+  if (!encoded) return undefined;
+  const trimmed = encoded.trim();
+  return /^\d+$/.test(trimmed) ? trimmed : undefined;
+}
+
+/**
+ * True when a criteria offer targets specific token(s) rather than the whole
+ * collection. OpenSea sends `encoded_token_ids: "*"` for collection-wide
+ * offers, so anything empty or wildcard means "any item".
+ */
+export function targetsSpecificTokens(encoded: string | undefined): boolean {
+  if (!encoded) return false;
+  const trimmed = encoded.trim();
+  return trimmed.length > 0 && trimmed !== "*";
 }
 
 /** value is a base-unit string (e.g. wei), decimals is typically 18 for ETH/WETH. Precision beyond ~15-17 significant digits is not preserved — fine for display/threshold comparisons, not for constructing transactions. */

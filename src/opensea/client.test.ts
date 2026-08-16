@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatPriceWithUsd, OpenSeaClient } from "./client.js";
+import { decodeSingleTokenId, formatPriceWithUsd, OpenSeaClient, targetsSpecificTokens } from "./client.js";
 
 /**
  * Stubs global.fetch so a fresh OpenSeaClient (which has a real API key
@@ -64,4 +64,33 @@ test("formatPriceWithUsd: non-ETH-pegged currencies with no knownUsd show native
 
 test("formatPriceWithUsd: knownUsd (e.g. a stablecoin sale) takes priority over a computed ETH rate", () => {
   assert.equal(formatPriceWithUsd(250, "USDC", { knownUsd: 250, ethUsdRate: 3000 }), "250 USDC (~$250)");
+});
+
+// --- Offer scope classification (regression: "*" is collection-wide) ----
+
+test("targetsSpecificTokens: the '*' wildcard means ANY item, not a specific token", () => {
+  // Confirmed live: OpenSea sends encoded_token_ids:"*" on every
+  // collection-wide offer. Treating presence as truthy misclassified all of
+  // them as item offers, which also left the above-market-offer check inert
+  // (it filters on scope === "collection" and found none).
+  assert.equal(targetsSpecificTokens("*"), false);
+  assert.equal(targetsSpecificTokens(" * "), false);
+  assert.equal(targetsSpecificTokens(""), false);
+  assert.equal(targetsSpecificTokens(undefined), false);
+});
+
+test("targetsSpecificTokens: a concrete id or set does target specific tokens", () => {
+  assert.equal(targetsSpecificTokens("1234"), true);
+  assert.equal(targetsSpecificTokens("1,2,3"), true);
+  assert.equal(targetsSpecificTokens("1:100"), true);
+});
+
+test("decodeSingleTokenId: only an unambiguous single id yields a token id", () => {
+  assert.equal(decodeSingleTokenId("1234"), "1234");
+  assert.equal(decodeSingleTokenId(" 42 "), "42");
+  // A wildcard, list, or range must NOT name one arbitrary token.
+  assert.equal(decodeSingleTokenId("*"), undefined);
+  assert.equal(decodeSingleTokenId("1,2,3"), undefined);
+  assert.equal(decodeSingleTokenId("1:100"), undefined);
+  assert.equal(decodeSingleTokenId(undefined), undefined);
 });

@@ -13,7 +13,7 @@ import type { Alert, CollectionInfo, CollectionOfferInfo, ListingInfo, SaleInfo,
 import type { BidLeadCandidate } from "./candidate.js";
 import { evaluateCandidate, type WatchlistMatch } from "./evaluate.js";
 import { renderFloorChart } from "../chart/floorChart.js";
-import { decideHighestOffer } from "./highestOffer.js";
+import { decideHighestOffers } from "./highestOffer.js";
 import { HighestOfferStore, type HighestOfferRecord } from "./highestOfferStore.js";
 import { FloorHistoryStore, type FloorSample } from "./historyStore.js";
 import { ListingAnchorStore } from "./listingAnchorStore.js";
@@ -58,9 +58,12 @@ export type WhaleActivityHandler = (activity: WhaleActivity) => void | Promise<v
 export interface HighestOfferEvent {
   collectionId: string;
   collectionName: string;
+  /** Used for trait- and collection-scoped offers, which apply to many items. */
   collectionImageUrl?: string;
+  /** Item-scoped offers only — the specific token's art. */
+  itemImageUrl?: string;
   record: HighestOfferRecord;
-  /** The high this beat. */
+  /** The high this beat, within the SAME scope. */
   previous: HighestOfferRecord;
   ethUsdRate?: number;
 }
@@ -911,42 +914,57 @@ export class BidLeadMonitor {
     const entry = this.watchlistConfig.entries.find((e) => e.enabled && e.collection.toLowerCase() === collectionId.toLowerCase());
     if (!entry) return; // allowlist-only, same posture as every other emission path
 
-    const decision = decideHighestOffer(offers, this.highestOfferStore.get(collectionId));
+    // One decision per scope present this tick — collection-wide, each
+    // trait, and item offers are independent markets with their own records.
+    const decisions = decideHighestOffers(offers, this.highestOfferStore.getForCollection(collectionId));
 
-    if (decision.action === "none") return;
+    for (const decision of decisions) {
+      if (decision.action === "none") continue;
 
-    if (decision.action === "baseline") {
-      this.highestOfferStore.set(collectionId, decision.record);
+      if (decision.action === "baseline") {
+        this.highestOfferStore.set(collectionId, decision.scopeKey, decision.record);
+        console.log(
+          `[highest-offer] Baselined ${floor.name} [${decision.scopeKey}] at ${decision.record.priceNative} ` +
+            `${decision.record.priceCurrency} (${decision.reason}) — recorded WITHOUT posting.`,
+        );
+        continue;
+      }
+
+      // Rate-limited/deduped through the same per-entry limiter as every
+      // other signal, under its own key namespace so it can never suppress
+      // (or be suppressed by) leads, sales, offers, or whale activity. The
+      // scope key is part of the dedupe key so a collection record and a
+      // trait record can both fire on the same tick.
+      const dedupeKey = `highest-offer:${collectionId}:${decision.scopeKey}:${decision.record.offerId}`;
+      if (this.limiter.check(entry, dedupeKey)) continue;
+      this.limiter.recordFired(entry, dedupeKey);
+
+      this.highestOfferStore.set(collectionId, decision.scopeKey, decision.record);
+
+      // Image source depends on scope: an item offer is about ONE token, so
+      // it shows that token's art; trait and collection offers apply to many
+      // items, so the collection image is the only honest illustration.
+      let imageUrl: string | undefined;
+      if (decision.record.scope === "token" && decision.record.tokenId) {
+        imageUrl = await openseaClient.getNftImage(collectionId, decision.record.tokenId).catch(() => undefined);
+      }
+      const collectionImage = await openseaClient.getCollectionImage(collectionId).catch(() => null);
+
       console.log(
-        `[highest-offer] Baselined ${floor.name} at ${decision.record.priceNative} ${decision.record.priceCurrency} ` +
-          `(${decision.reason}) — recorded WITHOUT posting.`,
+        `[highest-offer] NEW RECORD for ${floor.name} [${decision.scopeKey}]: ${decision.record.priceNative} ` +
+          `${decision.record.priceCurrency} (was ${decision.previous.priceNative}).`,
       );
-      return;
+
+      await this.onHighestOffer({
+        collectionId,
+        collectionName: floor.name,
+        collectionImageUrl: collectionImage?.imageUrl,
+        itemImageUrl: imageUrl,
+        record: decision.record,
+        previous: decision.previous,
+        ethUsdRate,
+      });
     }
-
-    // Rate-limited/deduped through the same per-entry limiter as every other
-    // signal, under its own key namespace so it can never suppress (or be
-    // suppressed by) leads, sales, offers, or whale activity for this entry.
-    const dedupeKey = `highest-offer:${collectionId}:${decision.record.offerId}`;
-    if (this.limiter.check(entry, dedupeKey)) return;
-    this.limiter.recordFired(entry, dedupeKey);
-
-    this.highestOfferStore.set(collectionId, decision.record);
-    const collectionImage = await openseaClient.getCollectionImage(collectionId).catch(() => null);
-
-    console.log(
-      `[highest-offer] NEW RECORD for ${floor.name}: ${decision.record.priceNative} ${decision.record.priceCurrency} ` +
-        `(was ${decision.previous.priceNative}) scope=${decision.record.scope}.`,
-    );
-
-    await this.onHighestOffer({
-      collectionId,
-      collectionName: floor.name,
-      collectionImageUrl: collectionImage?.imageUrl,
-      record: decision.record,
-      previous: decision.previous,
-      ethUsdRate,
-    });
   }
 
   /**

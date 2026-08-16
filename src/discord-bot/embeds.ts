@@ -549,9 +549,12 @@ export function buildHelpEmbed(): EmbedContent {
       {
         name: "💰 #highest-offers",
         value:
-          "Fires when a watched collection's top offer sets a **new record high** — max across collection-wide, trait, and item offers. " +
-          "Shows amount (ETH + USD), offer type, offerer, and the delta vs. the previous high. Not a feed of every offer: standing offers " +
-          "never repost, and the current high is baselined silently on first run so restarts don't replay it.",
+          "Fires when a watched collection's top offer sets a **new record high**, tracked separately per offer kind:\n" +
+          "🎯 **Item** (one specific token — shows that item's image + #tokenId) · " +
+          "🏷️ **Trait** (any item with a given trait — shows the collection image + the trait, each trait its own record) · " +
+          "🌐 **Collection** (any item — collection image).\n" +
+          "Each post names the scope and the delta vs. that scope's own previous high. Not a feed of every offer: standing offers never " +
+          "repost, and every scope is baselined silently on first run so restarts don't replay it.",
         inline: false,
       },
       {
@@ -743,32 +746,69 @@ export function buildHighestOfferEmbed(event: HighestOfferEvent): EmbedContent {
   const priceText = formatPriceWithUsd(record.priceNative, record.priceCurrency, { ethUsdRate });
   const previousText = formatPriceWithUsd(previous.priceNative, previous.priceCurrency, { ethUsdRate });
 
-  const scopeLabel =
-    record.scope === "collection"
-      ? "collection-wide"
-      : record.scope === "trait"
-        ? "trait offer"
-        : `item offer${record.tokenId ? ` (#${record.tokenId})` : ""}`;
+  const isItem = record.scope === "token";
+  const isTrait = record.scope === "trait";
+
+  // Title states the scope unmistakably — these three are NOT equivalent
+  // offers, and reading "new highest offer" without knowing which kind it is
+  // would be actively misleading.
+  const title = isItem
+    ? `🎯 New highest ITEM offer — ${event.collectionName}${record.tokenId ? ` #${record.tokenId}` : ""}`
+    : isTrait
+      ? `🏷️ New highest TRAIT offer — ${event.collectionName}`
+      : `🌐 New highest COLLECTION offer — ${event.collectionName}`;
+
+  const scopeLine = isItem
+    ? `Offer on **one specific token**${record.tokenId ? ` (#${record.tokenId})` : ""} — not the whole collection.`
+    : isTrait
+      ? record.trait
+        ? `Trait-exclusive offer: applies to **any item with \`${record.trait.key} = ${record.trait.value}\`** — not the whole collection.`
+        : "Trait-exclusive offer: applies to any item carrying the offered trait — not the whole collection."
+      : "Collection-wide offer: applies to **any item** in the collection.";
 
   const pct = previous.priceNative > 0 ? ((record.priceNative - previous.priceNative) / previous.priceNative) * 100 : null;
-  const deltaText = pct !== null ? `▲ **new high ${record.priceNative} ${record.priceCurrency}**, up from ${previous.priceNative} (+${pct.toFixed(1)}%)` : `▲ **new high ${record.priceNative} ${record.priceCurrency}**`;
+  const deltaText =
+    pct !== null
+      ? `▲ **new high ${record.priceNative} ${record.priceCurrency}**, up from ${previous.priceNative} (+${pct.toFixed(1)}%)`
+      : `▲ **new high ${record.priceNative} ${record.priceCurrency}**`;
 
-  const links = [`[OpenSea](https://opensea.io/assets/ethereum/${event.collectionId})`, `[Etherscan: offerer](https://etherscan.io/address/${record.bidder})`];
+  const scopeValue = isItem
+    ? `Item offer${record.tokenId ? ` · #${record.tokenId}` : ""}`
+    : isTrait
+      ? record.trait
+        ? `Trait offer · ${record.trait.key} = ${record.trait.value}`
+        : "Trait offer"
+      : "Collection offer · any item";
+
+  const links = [
+    `[OpenSea](https://opensea.io/assets/ethereum/${event.collectionId})`,
+    `[Etherscan: offerer](https://etherscan.io/address/${record.bidder})`,
+  ];
   if (record.tokenId) links.unshift(`[Item](https://opensea.io/assets/ethereum/${event.collectionId}/${record.tokenId})`);
 
   return {
-    title: `💰 New highest offer — ${event.collectionName}`,
-    description: deltaText,
+    title,
+    description: `${deltaText}\n${scopeLine}`,
     color: COLOR_ACCEPT,
     fields: [
       { name: "Offer", value: priceText, inline: true },
-      { name: "Previous high", value: previousText, inline: true },
-      { name: "Type", value: scopeLabel, inline: true },
+      { name: "Previous high (same scope)", value: previousText, inline: true },
+      { name: "Scope", value: scopeValue, inline: true },
       { name: "Offerer", value: shortAddress(record.bidder), inline: true },
       { name: "Links", value: links.join(" · "), inline: false },
     ],
-    thumbnail: event.collectionImageUrl,
-    footer: withUsdFootnote("Record high across collection, trait, and item offers.", ethUsdRate !== undefined),
+    // Item offers show that token's art; trait and collection offers apply to
+    // many items, so the collection image is the only honest illustration.
+    image: isItem ? event.itemImageUrl : undefined,
+    thumbnail: isItem ? undefined : event.collectionImageUrl,
+    footer: withUsdFootnote(
+      isItem
+        ? "Record high for ITEM offers on this collection."
+        : isTrait
+          ? "Record high for THIS trait. Tracked separately from collection-wide and item offers."
+          : "Record high for COLLECTION-WIDE offers. Tracked separately from trait and item offers.",
+      ethUsdRate !== undefined,
+    ),
     timestamp: record.recordedAt,
   };
 }
