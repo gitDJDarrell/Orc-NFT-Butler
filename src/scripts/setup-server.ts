@@ -496,7 +496,15 @@ function buildCommandsEmbeds(): ReturnType<EmbedBuilder["toJSON"]>[] {
           "(✅ ACCEPTED / ❌ DENIED / 👀 WATCHING badge + color) once decided.",
         inline: false,
       },
-      { name: "/watchlist add|remove|list|create-rule", value: "Manage the allowlist. `add collection:<name|slug|address>` · `remove collection:<...>` · `list` · `create-rule`", inline: false },
+      {
+        name: "/watchlist add|remove|list|create-rule",
+        value:
+          "Manage the allowlist. `add collection:<name|slug|address>` · `remove collection:<...>` · `list` · `create-rule`\n" +
+          "**`add` can also scope to a trait**: pass `trait_category` + `trait_value` (both autocompleted from the collection's real trait " +
+          "catalog) and only items with that trait produce leads/listings/alerts for the entry. Omit them for the whole collection. " +
+          "A trait that isn't in the collection is rejected, and the same collection can be added again under a different trait.",
+        inline: false,
+      },
       { name: "/listings collection: hours:", value: "Recent listings within the past N hours (default 24).", inline: false },
       { name: "/floor collection:", value: "Current floor price and stats.", inline: false },
       { name: "/offers collection:", value: "Current top offers/bids.", inline: false },

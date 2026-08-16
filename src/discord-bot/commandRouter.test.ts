@@ -78,10 +78,14 @@ function makeDeps(overrides: Partial<CommandRouterDeps> = {}): { deps: CommandRo
     getCollectionImage: async () => null,
     getEthUsdRate: async () => undefined,
     listWatchlistEntries: () => [],
-    addWatchlistEntry: (resolved, floor) => {
-      calls.addWatchlistEntry!.push({ resolved, floor });
+    addWatchlistEntry: (resolved, floor, trait) => {
+      calls.addWatchlistEntry!.push({ resolved, floor, trait });
       return { ok: true, message: "added" } satisfies AddWatchlistOutcome;
     },
+    getCollectionTraits: async () => [
+      { key: "Background", values: ["Blue", "Red"] },
+      { key: "Headwear", values: ["Crown"] },
+    ],
     removeWatchlistEntry: (input, resolvedAddress) => {
       calls.removeWatchlistEntry!.push({ input, resolvedAddress });
       return { ok: true, message: "removed" } satisfies RemoveWatchlistOutcome;
@@ -383,4 +387,117 @@ test("routeCommand: a thrown error from a dep is caught and reported ephemerally
   const reply = await routeCommand(deps, makeInvocation({ commandName: "floor", collection: "Test Collection" }));
   assert.equal(reply.ephemeral, true);
   assert.match(reply.content ?? "", /went wrong/);
+});
+
+// --- /watchlist add with optional trait scoping -------------------------
+
+test("watchlist add: without traits, the preview carries no trait (unchanged behavior)", async () => {
+  const { deps } = makeDeps();
+  const reply = await routeCommand(deps, makeInvocation({ commandName: "watchlist", subcommand: "add", collection: "Azuki" }));
+
+  assert.equal(reply.pendingAdd?.trait, undefined);
+  assert.equal(reply.ephemeral, true);
+});
+
+test("watchlist add: a valid trait is validated against the catalog and carried into the preview", async () => {
+  const { deps } = makeDeps();
+  const reply = await routeCommand(
+    deps,
+    makeInvocation({ commandName: "watchlist", subcommand: "add", collection: "Azuki", traitCategory: "Background", traitValue: "Blue" }),
+  );
+
+  assert.deepEqual(reply.pendingAdd?.trait, { key: "Background", value: "Blue" });
+});
+
+test("watchlist add: trait casing is normalized to the collection's real catalog", async () => {
+  const { deps } = makeDeps();
+  const reply = await routeCommand(
+    deps,
+    makeInvocation({ commandName: "watchlist", subcommand: "add", collection: "Azuki", traitCategory: "background", traitValue: "blue" }),
+  );
+
+  assert.deepEqual(reply.pendingAdd?.trait, { key: "Background", value: "Blue" });
+});
+
+test("watchlist add: the preview embed shows the trait scope", async () => {
+  const { deps } = makeDeps();
+  const reply = await routeCommand(
+    deps,
+    makeInvocation({ commandName: "watchlist", subcommand: "add", collection: "Azuki", traitCategory: "Background", traitValue: "Blue" }),
+  );
+
+  assert.match(reply.embed?.title ?? "", /Background: Blue/);
+  assert.ok(
+    reply.embed?.fields.some((f) => f.name === "Trait scope" && f.value.includes("Blue")),
+    "preview should carry a Trait scope field",
+  );
+});
+
+test("watchlist add: an invalid trait is REJECTED and nothing is staged", async () => {
+  const { deps } = makeDeps();
+  const reply = await routeCommand(
+    deps,
+    makeInvocation({ commandName: "watchlist", subcommand: "add", collection: "Azuki", traitCategory: "Background", traitValue: "Chartreuse" }),
+  );
+
+  assert.equal(reply.pendingAdd, undefined, "an invalid trait must not produce a confirmable preview");
+  assert.match(reply.content ?? "", /isn't a value of/i);
+});
+
+test("watchlist add: an unknown trait category is rejected", async () => {
+  const { deps } = makeDeps();
+  const reply = await routeCommand(
+    deps,
+    makeInvocation({ commandName: "watchlist", subcommand: "add", collection: "Azuki", traitCategory: "Nope", traitValue: "Blue" }),
+  );
+
+  assert.equal(reply.pendingAdd, undefined);
+  assert.match(reply.content ?? "", /isn't a trait category/i);
+});
+
+test("watchlist add: half a trait (category without value, or vice versa) is rejected", async () => {
+  const { deps } = makeDeps();
+
+  const onlyCategory = await routeCommand(
+    deps,
+    makeInvocation({ commandName: "watchlist", subcommand: "add", collection: "Azuki", traitCategory: "Background" }),
+  );
+  assert.equal(onlyCategory.pendingAdd, undefined);
+  assert.match(onlyCategory.content ?? "", /both/i);
+
+  const onlyValue = await routeCommand(
+    deps,
+    makeInvocation({ commandName: "watchlist", subcommand: "add", collection: "Azuki", traitValue: "Blue" }),
+  );
+  assert.equal(onlyValue.pendingAdd, undefined);
+  assert.match(onlyValue.content ?? "", /both/i);
+});
+
+test("watchlist add: an autocomplete hint sentinel is treated as 'no trait', not a real trait", async () => {
+  const { deps } = makeDeps();
+  const reply = await routeCommand(
+    deps,
+    makeInvocation({
+      commandName: "watchlist",
+      subcommand: "add",
+      collection: "Azuki",
+      traitCategory: "__no_selection__",
+      traitValue: "__no_selection__",
+    }),
+  );
+
+  // Both halves are hints -> treated as absent -> a normal collection-wide add.
+  assert.equal(reply.pendingAdd?.trait, undefined);
+  assert.ok(reply.pendingAdd, "should still produce a normal preview");
+});
+
+test("watchlist add: a trait that can't be verified (catalog unavailable) is rejected rather than guessed", async () => {
+  const { deps } = makeDeps({ getCollectionTraits: async () => [] });
+  const reply = await routeCommand(
+    deps,
+    makeInvocation({ commandName: "watchlist", subcommand: "add", collection: "Azuki", traitCategory: "Background", traitValue: "Blue" }),
+  );
+
+  assert.equal(reply.pendingAdd, undefined);
+  assert.match(reply.content ?? "", /can't be verified|couldn't load/i);
 });

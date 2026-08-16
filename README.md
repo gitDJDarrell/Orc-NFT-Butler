@@ -692,7 +692,7 @@ separate command.
 
 | Command | What it does |
 |---|---|
-| `/watchlist add collection:<name\|slug\|address>` | Resolves via OpenSea, then shows a **preview** (name/floor/image/owners) with Confirm/Cancel buttons — nothing is written until you confirm. |
+| `/watchlist add collection:<name\|slug\|address> [trait_category:] [trait_value:]` | Resolves via OpenSea, then shows a **preview** (name/floor/image/owners, plus the trait scope if set) with Confirm/Cancel buttons — nothing is written until you confirm. See [Scoping an add to a trait](#scoping-an-add-to-a-trait). |
 | `/watchlist remove collection:<name\|slug\|address>` | Removes the matching entry from `watchlist.json`. |
 | `/watchlist list` | Shows every current allowlist entry (name, address, enabled, key filters). |
 | `/watchlist create-rule collection: condition: ...` | Guided single-condition lead rule — see [Guided lead rules](#guided-lead-rules--traits) below. |
@@ -1026,6 +1026,50 @@ on at most 12 tokens (largest holdings first), so `/portfolio` can't blow
 the OpenSea request budget. The embed states what was sampled and whether
 any collection's floor was unreadable, so a partial figure is never mistaken
 for a complete one.
+
+### Scoping an add to a trait
+
+`/watchlist add` takes two optional extras, `trait_category` and
+`trait_value`. Supply both and the entry is **scoped to that trait** — only
+items carrying it produce leads, new-listing posts, or alerts for that entry:
+
+```
+/watchlist add collection:Azuki trait_category:Background trait_value:Blue
+```
+
+Mechanically the trait is stored in the entry's `traits` array, which
+`evaluate.ts` already enforces (a candidate matches only if its trait set
+contains one of them), so this reuses the existing evaluation path rather
+than adding a parallel one. Everything else about the add is unchanged: the
+usual price-band / bid-spread / liquidity / trend defaults are still applied,
+**layered on top of** the trait rather than replaced. The trait narrows
+*which items* qualify; the defaults still decide *which of those* are worth
+surfacing.
+
+That's the deliberate difference from `/watchlist create-rule`, which builds
+a single-condition entry with no implied defaults. Use `add` for "watch this
+collection, but only the Blue ones"; use `create-rule` for "alert me on
+exactly this one condition".
+
+Details worth knowing:
+
+- **Both halves are required together.** Supplying only a category (or only a
+  value) is rejected rather than silently ignored.
+- **The trait is validated against the collection's real catalog** before the
+  preview appears. A category or value the collection doesn't have is
+  rejected, with the valid options listed. Casing is normalized to the
+  catalog's, since that's what OpenSea reports on listings — a
+  case-mismatched trait would otherwise never match anything.
+- **The same collection can be added more than once under different traits**
+  (Blue backgrounds and Gold fur as separate entries). Duplicate detection
+  keys on collection **+ trait**, so only an identical pairing is refused.
+  A collection-wide entry and a trait-scoped one can coexist.
+- **Both fields are autocompleted** from the collection's real trait catalog,
+  using the same cached-catalog autocomplete as `create-rule` (see below) —
+  it resolves whatever is currently in the `collection` field first, so it
+  works for a brand-new collection that isn't on the watchlist yet.
+- The preview embed and the confirmation message both show the trait scope,
+  so you can see what you're about to commit to.
 
 ### Guided lead rules + traits
 

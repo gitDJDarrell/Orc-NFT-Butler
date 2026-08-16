@@ -16,12 +16,24 @@ export const commandDefinitions = [
     .addSubcommand((sub) =>
       sub
         .setName("add")
-        .setDescription("Add a collection to the watchlist with sensible default filters")
+        .setDescription("Add a collection to the watchlist, optionally scoped to one trait")
         .addStringOption((opt) =>
           opt
             .setName("collection")
             .setDescription("Collection name, OpenSea slug, or 0x contract address")
             .setRequired(true)
+            .setAutocomplete(true),
+        )
+        .addStringOption((opt) =>
+          opt
+            .setName("trait_category")
+            .setDescription("Optional: only surface items with this trait (pick a collection first)")
+            .setAutocomplete(true),
+        )
+        .addStringOption((opt) =>
+          opt
+            .setName("trait_value")
+            .setDescription("Optional: the trait value (pick a category first)")
             .setAutocomplete(true),
         ),
     )

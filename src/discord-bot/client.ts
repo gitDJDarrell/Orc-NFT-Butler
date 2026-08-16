@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 import type { NftDeFiAgent } from "../agent/index.js";
 import { config } from "../config/env.js";
 import { openseaClient, type ResolvedCollection } from "../opensea/client.js";
-import type { Alert, CollectionInfo, SaleInfo } from "../types/index.js";
+import type { Alert, CollectionInfo, SaleInfo, Trait } from "../types/index.js";
 import type { BidLeadCandidate } from "../watchlist/candidate.js";
 import type { BidLeadMonitor } from "../watchlist/leadMonitor.js";
 import type { WatchlistMatch } from "../watchlist/evaluate.js";
@@ -271,15 +271,19 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
   });
 
   /** /watchlist add: mutates watchlist.json on disk and reloads the live BidLeadMonitor, without dropping the gateway connection. */
-  function addWatchlistEntry(resolved: ResolvedCollection, floor: CollectionInfo | null): AddWatchlistOutcome {
+  function addWatchlistEntry(resolved: ResolvedCollection, floor: CollectionInfo | null, trait?: Trait): AddWatchlistOutcome {
     try {
       const cfg = loadWatchlistConfig(config.WATCHLIST_CONFIG_PATH);
-      const result = planAddEntry(cfg, resolved, floor);
+      const result = planAddEntry(cfg, resolved, floor, trait);
       if (!result.ok) return { ok: false, message: result.message };
 
       saveWatchlistConfig(result.config, config.WATCHLIST_CONFIG_PATH);
       leadMonitor.reload();
-      return { ok: true, message: `Added ${resolved.name}.`, entry: result.entry };
+      return {
+        ok: true,
+        message: `Added ${resolved.name}${trait ? ` scoped to ${trait.key}: ${trait.value}` : ""}.`,
+        entry: result.entry,
+      };
     } catch (err) {
       return { ok: false, message: `Failed to add to watchlist.json: ${(err as Error).message}` };
     }
@@ -291,7 +295,7 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
   /** Builds the Confirm/Cancel row for a /watchlist add preview, registering it under a fresh token in PendingAddStore first (the token has to exist before the buttons' custom IDs can be built). */
   function buildAddConfirmationRow(pendingAdd: PendingAddPreview): ActionRowBuilder<ButtonBuilder> {
     const token = randomUUID();
-    pendingAdds.add(token, pendingAdd.resolved, pendingAdd.floor);
+    pendingAdds.add(token, pendingAdd.resolved, pendingAdd.floor, pendingAdd.trait);
 
     const confirm = new ButtonBuilder().setCustomId(`${ADD_CONFIRM_PREFIX}${token}`).setLabel("Confirm add").setStyle(ButtonStyle.Success);
     const cancel = new ButtonBuilder().setCustomId(`${ADD_CANCEL_PREFIX}${token}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary);
@@ -330,10 +334,11 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
       return;
     }
 
-    const outcome = addWatchlistEntry(pending.resolved, pending.floor);
+    const outcome = addWatchlistEntry(pending.resolved, pending.floor, pending.trait);
     const floorText = pending.floor ? ` Current floor: ${pending.floor.floorPriceNative} ${pending.floor.floorPriceCurrency}.` : "";
+    const traitText = pending.trait ? ` Scoped to **${pending.trait.key}: ${pending.trait.value}**.` : "";
     const content = outcome.ok
-      ? `✅ Added **${pending.resolved.name}** (\`${pending.resolved.address}\`) to the watchlist.${floorText}`
+      ? `✅ Added **${pending.resolved.name}** (\`${pending.resolved.address}\`) to the watchlist.${traitText}${floorText}`
       : outcome.message;
     await interaction.update({ content, embeds: [], components: [] }).catch(() => undefined);
   }
@@ -530,6 +535,7 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
     getEthUsdRate: () => openseaClient.getEthUsdRate(),
     listWatchlistEntries: () => leadMonitor.getEntries(),
     addWatchlistEntry,
+    getCollectionTraits: (idOrSlug) => openseaClient.getCollectionTraits(idOrSlug),
     removeWatchlistEntry,
     createLeadRule,
     getStatusInfo,

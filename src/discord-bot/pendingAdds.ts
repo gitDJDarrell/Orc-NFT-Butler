@@ -1,9 +1,11 @@
 import type { ResolvedCollection } from "../opensea/client.js";
-import type { CollectionInfo } from "../types/index.js";
+import type { CollectionInfo, Trait } from "../types/index.js";
 
 export interface PendingAdd {
   resolved: ResolvedCollection;
   floor: CollectionInfo | null;
+  /** Optional trait scope chosen on /watchlist add — carried through Confirm so the created entry matches the preview. */
+  trait?: Trait;
   createdAt: string;
 }
 
@@ -20,8 +22,8 @@ export interface PendingAdd {
 export class PendingAddStore {
   private readonly pending = new Map<string, PendingAdd>();
 
-  add(token: string, resolved: ResolvedCollection, floor: CollectionInfo | null): void {
-    this.pending.set(token, { resolved, floor, createdAt: new Date().toISOString() });
+  add(token: string, resolved: ResolvedCollection, floor: CollectionInfo | null, trait?: Trait): void {
+    this.pending.set(token, { resolved, floor, trait, createdAt: new Date().toISOString() });
   }
 
   get(token: string): PendingAdd | undefined {

@@ -1,7 +1,7 @@
 import { EmbedBuilder } from "discord.js";
 import { formatPriceWithUsd, type ResolvedCollection } from "../opensea/client.js";
 import type { RateLimitHealth } from "../opensea/requestScheduler.js";
-import type { Alert, CollectionInfo, CollectionOfferInfo, DryRunResult, ListingInfo, SaleInfo } from "../types/index.js";
+import type { Alert, CollectionInfo, CollectionOfferInfo, DryRunResult, ListingInfo, SaleInfo, Trait } from "../types/index.js";
 import type { PortfolioSnapshot } from "../portfolio/portfolio.js";
 import type { BidLeadCandidate } from "../watchlist/candidate.js";
 import type { WatchlistMatch } from "../watchlist/evaluate.js";
@@ -222,11 +222,15 @@ export function buildAddPreviewEmbed(
   floor: CollectionInfo | null,
   thumbnail?: string,
   ethUsdRate?: number,
+  trait?: Trait,
 ): EmbedContent {
   const fields: EmbedFieldContent[] = [
     { name: "Slug", value: resolved.slug, inline: true },
     { name: "Address", value: resolved.address, inline: true },
   ];
+  if (trait) {
+    fields.push({ name: "Trait scope", value: `**${trait.key}: ${trait.value}**`, inline: true });
+  }
   if (floor) {
     fields.push({ name: "Floor", value: formatPriceWithUsd(floor.floorPriceNative, floor.floorPriceCurrency, { ethUsdRate }), inline: true });
     if (floor.owners !== undefined) fields.push({ name: "Owners", value: String(floor.owners), inline: true });
@@ -238,8 +242,11 @@ export function buildAddPreviewEmbed(
   }
 
   return {
-    title: `Add to watchlist? — ${resolved.name}`,
-    description: "Review the details below, then confirm or cancel — nothing is added until you do.",
+    title: `Add to watchlist? — ${resolved.name}${trait ? ` (${trait.key}: ${trait.value})` : ""}`,
+    description: trait
+      ? `Review the details below, then confirm or cancel — nothing is added until you do.\n` +
+        `**Scoped to \`${trait.key}: ${trait.value}\`** — only items carrying this trait will produce leads, listings, or alerts for this entry.`
+      : "Review the details below, then confirm or cancel — nothing is added until you do.",
     color: COLOR_LEAD,
     fields,
     thumbnail,
@@ -477,11 +484,14 @@ export function buildHelpEmbed(): EmbedContent {
     color: COLOR_INFO,
     fields: [
       {
-        name: "/watchlist add collection:<name|slug|address>",
+        name: "/watchlist add collection:<...> [trait_category:] [trait_value:]",
         value:
           "Preview a collection (name/floor/image/owners), then Confirm/Cancel before it's added. " +
-          "Autocomplete suggests watchlist entries + live OpenSea matches as you type, but search coverage is uneven for small/new collections — " +
-          "if it doesn't show up, use the exact slug from its opensea.io/collection/<slug> URL, or its 0x contract address.",
+          "**Optionally scope it to one trait** — supply `trait_category` + `trait_value` and only items carrying that trait will produce leads, " +
+          "listings, or alerts for the entry. Both are autocompleted from the collection's real trait catalog, and a trait that isn't in the " +
+          "collection is rejected. Omit them to watch the whole collection. The same collection can be added more than once under different traits.\n" +
+          "Collection autocomplete suggests watchlist entries + live OpenSea matches as you type, but search coverage is uneven for small/new " +
+          "collections — if it doesn't show up, use the exact slug from its opensea.io/collection/<slug> URL, or its 0x contract address.",
         inline: false,
       },
       { name: "/watchlist remove collection:<name|slug|address>", value: "Remove a collection from the allowlist.", inline: false },

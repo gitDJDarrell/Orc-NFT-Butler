@@ -2,7 +2,16 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ResolvedCollection } from "../opensea/client.js";
 import type { CollectionInfo } from "../types/index.js";
-import { buildDefaultEntry, buildLeadRuleEntry, findMatchingEntry, planAddEntry, planCreateLeadRule, planRemoveEntry, validateLeadRuleParams } from "./mutate.js";
+import {
+  buildDefaultEntry,
+  buildLeadRuleEntry,
+  findMatchingEntry,
+  planAddEntry,
+  planCreateLeadRule,
+  planRemoveEntry,
+  validateLeadRuleParams,
+  validateTraitAgainstCatalog,
+} from "./mutate.js";
 import type { AllowlistConfig, AllowlistEntry } from "./schema.js";
 
 function makeResolved(overrides: Partial<ResolvedCollection> = {}): ResolvedCollection {
@@ -199,4 +208,108 @@ test("planCreateLeadRule: appends the new rule, allowing multiple rules for the 
 
   assert.equal(second.config.entries.length, 2);
   assert.equal(second.config.entries.every((e) => e.collection === makeResolved().address), true);
+});
+
+// --- /watchlist add with an optional trait scope ------------------------
+
+test("planAddEntry: without a trait behaves exactly as before (no traits key)", () => {
+  const result = planAddEntry({ entries: [] }, makeResolved(), null);
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.entry.traits, undefined);
+  assert.equal(result.ok && result.entry.label, "Test Collection");
+});
+
+test("planAddEntry: a trait scopes the entry via `traits`, which evaluate.ts enforces", () => {
+  const result = planAddEntry({ entries: [] }, makeResolved(), null, { key: "Background", value: "Blue" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.ok && result.entry.traits, [{ key: "Background", value: "Blue" }]);
+});
+
+test("planAddEntry: a trait-scoped entry KEEPS the sensible default filters (layered, not replaced)", () => {
+  const result = planAddEntry({ entries: [] }, makeResolved(), null, { key: "Background", value: "Blue" });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.ok(result.entry.filters.priceBand, "price band default should survive");
+  assert.ok(result.entry.filters.bidSpread, "bid spread default should survive");
+  assert.ok(result.entry.filters.trend, "trend default should survive");
+});
+
+test("planAddEntry: trait appears in the label and the generated id", () => {
+  const result = planAddEntry({ entries: [] }, makeResolved(), null, { key: "Background", value: "Blue" });
+  assert.equal(result.ok, true);
+  assert.match(result.ok ? result.entry.label : "", /Background: Blue/);
+  assert.match(result.ok ? result.entry.id : "", /background-blue/);
+});
+
+test("planAddEntry: the SAME collection can be added twice under different traits", () => {
+  const first = planAddEntry({ entries: [] }, makeResolved(), null, { key: "Background", value: "Blue" });
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+
+  const second = planAddEntry(first.config, makeResolved(), null, { key: "Background", value: "Red" });
+  assert.equal(second.ok, true, "a different trait on the same collection is not a duplicate");
+  assert.equal(second.ok && second.config.entries.length, 2);
+  assert.notEqual(first.entry.id, second.ok ? second.entry.id : first.entry.id, "ids must not collide");
+});
+
+test("planAddEntry: the same collection + same trait IS a duplicate (case-insensitive)", () => {
+  const first = planAddEntry({ entries: [] }, makeResolved(), null, { key: "Background", value: "Blue" });
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+
+  const dup = planAddEntry(first.config, makeResolved(), null, { key: "background", value: "blue" });
+  assert.equal(dup.ok, false);
+  assert.match(!dup.ok ? dup.message : "", /already on the watchlist/i);
+});
+
+test("planAddEntry: an untraited add still collides with an existing untraited entry", () => {
+  const first = planAddEntry({ entries: [] }, makeResolved(), null);
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+
+  const dup = planAddEntry(first.config, makeResolved(), null);
+  assert.equal(dup.ok, false);
+});
+
+test("planAddEntry: a traited add does NOT collide with an existing untraited entry", () => {
+  const first = planAddEntry({ entries: [] }, makeResolved(), null);
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+
+  const scoped = planAddEntry(first.config, makeResolved(), null, { key: "Background", value: "Blue" });
+  assert.equal(scoped.ok, true, "collection-wide and trait-scoped entries can coexist");
+});
+
+// --- Trait validation against the real catalog --------------------------
+
+const CATALOG = [
+  { key: "Background", values: ["Blue", "Red"] },
+  { key: "Headwear", values: ["Crown", "Cap"] },
+];
+
+test("validateTraitAgainstCatalog: accepts a real trait and normalizes casing to the catalog's", () => {
+  const result = validateTraitAgainstCatalog(CATALOG, "background", "BLUE");
+  assert.equal(result.ok, true);
+  // Stored casing must match what OpenSea reports on listings, or matching fails.
+  assert.deepEqual(result.ok && result.trait, { key: "Background", value: "Blue" });
+});
+
+test("validateTraitAgainstCatalog: rejects an unknown category and lists the real ones", () => {
+  const result = validateTraitAgainstCatalog(CATALOG, "Nonexistent", "Blue");
+  assert.equal(result.ok, false);
+  assert.match(!result.ok ? result.message : "", /isn't a trait category/i);
+  assert.match(!result.ok ? result.message : "", /Background/);
+});
+
+test("validateTraitAgainstCatalog: rejects an unknown value and lists the category's real values", () => {
+  const result = validateTraitAgainstCatalog(CATALOG, "Background", "Chartreuse");
+  assert.equal(result.ok, false);
+  assert.match(!result.ok ? result.message : "", /isn't a value of/i);
+  assert.match(!result.ok ? result.message : "", /Blue/);
+});
+
+test("validateTraitAgainstCatalog: an empty catalog is reported as unverifiable, not as a bad trait", () => {
+  const result = validateTraitAgainstCatalog([], "Background", "Blue");
+  assert.equal(result.ok, false);
+  assert.match(!result.ok ? result.message : "", /couldn't load|can't be verified/i);
 });

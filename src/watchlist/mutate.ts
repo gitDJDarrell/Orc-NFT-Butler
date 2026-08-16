@@ -1,4 +1,4 @@
-import type { CollectionInfo, Trait } from "../types/index.js";
+import type { CollectionInfo, Trait, TraitCategory } from "../types/index.js";
 import type { ResolvedCollection } from "../opensea/client.js";
 import { allowlistEntrySchema, type AllowlistConfig, type AllowlistEntry, type WatchlistFilters } from "./schema.js";
 
@@ -41,15 +41,24 @@ export function buildDefaultEntry(
   resolved: ResolvedCollection,
   floor: CollectionInfo | null,
   existingIds: readonly string[],
+  trait?: Trait,
 ): AllowlistEntry {
   const floorPrice = floor?.floorPriceNative && floor.floorPriceNative > 0 ? floor.floorPriceNative : 0.1;
 
+  // A trait scopes the entry via `traits`, which evaluate.ts already
+  // enforces: a candidate only matches if its trait set contains one of
+  // these. The generic price/spread/liquidity/trend defaults are LAYERED on
+  // top rather than replaced — /watchlist add still means "watch this
+  // collection sensibly", with the trait narrowing WHICH items qualify.
+  // (This is the opposite of /watchlist create-rule, which deliberately
+  // builds a single-condition entry with no implied defaults.)
   return allowlistEntrySchema.parse({
-    id: uniqueId(slugifyForId(resolved.name || resolved.slug || resolved.address), existingIds),
-    label: resolved.name,
+    id: uniqueId(slugifyForId(`${resolved.name || resolved.slug || resolved.address}${trait ? `-${trait.key}-${trait.value}` : ""}`), existingIds),
+    label: trait ? `${resolved.name} — ${trait.key}: ${trait.value}` : resolved.name,
     enabled: true,
     priorityTier: "watch",
     collection: resolved.address,
+    ...(trait ? { traits: [trait] } : {}),
     filters: {
       priceBand: {
         maxFloor: Number((floorPrice * 5).toFixed(6)),
@@ -64,16 +73,36 @@ export function buildDefaultEntry(
   });
 }
 
+/** True when two optional trait scopes refer to the same trait (case-insensitive), including both being absent. */
+function sameTraitScope(a: Trait | undefined, b: Trait | undefined): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return a.key.toLowerCase() === b.key.toLowerCase() && a.value.toLowerCase() === b.value.toLowerCase();
+}
+
 export type AddEntryResult =
   | { ok: true; config: AllowlistConfig; entry: AllowlistEntry }
   | { ok: false; message: string };
 
-export function planAddEntry(cfg: AllowlistConfig, resolved: ResolvedCollection, floor: CollectionInfo | null): AddEntryResult {
-  const existing = cfg.entries.find((e) => e.collection.toLowerCase() === resolved.address.toLowerCase());
+export function planAddEntry(
+  cfg: AllowlistConfig,
+  resolved: ResolvedCollection,
+  floor: CollectionInfo | null,
+  trait?: Trait,
+): AddEntryResult {
+  // Duplicate detection is scoped to the TRAIT, not just the collection:
+  // adding the same collection twice for two different traits is a
+  // legitimate thing to want (e.g. watch Blue backgrounds and Gold fur
+  // separately), so only an identical collection+trait pairing is a
+  // duplicate. Without the trait dimension this rejected every second add.
+  const existing = cfg.entries.find(
+    (e) => e.collection.toLowerCase() === resolved.address.toLowerCase() && sameTraitScope(e.traits?.[0], trait),
+  );
   if (existing) {
+    const scope = trait ? ` scoped to ${trait.key}: ${trait.value}` : "";
     return {
       ok: false,
-      message: `${resolved.name} is already on the watchlist as "${existing.label}"${existing.enabled ? "" : " (currently disabled)"}.`,
+      message: `${resolved.name}${scope} is already on the watchlist as "${existing.label}"${existing.enabled ? "" : " (currently disabled)"}.`,
     };
   }
 
@@ -81,8 +110,47 @@ export function planAddEntry(cfg: AllowlistConfig, resolved: ResolvedCollection,
     resolved,
     floor,
     cfg.entries.map((e) => e.id),
+    trait,
   );
   return { ok: true, config: { entries: [...cfg.entries, entry] }, entry };
+}
+
+/**
+ * Validates a requested trait against a collection's REAL trait catalog, so
+ * a typo (or a hand-typed trait that doesn't exist) is rejected up front
+ * rather than silently creating an entry that can never match anything.
+ * Matching is case-insensitive; the returned trait uses the catalog's exact
+ * casing so what gets stored matches what OpenSea reports on listings.
+ */
+export type TraitValidation = { ok: true; trait: Trait } | { ok: false; message: string };
+
+export function validateTraitAgainstCatalog(catalog: readonly TraitCategory[], key: string, value: string): TraitValidation {
+  if (catalog.length === 0) {
+    return { ok: false, message: "Could not load this collection's trait catalog, so the trait can't be verified. Try again in a moment, or add it without a trait." };
+  }
+
+  const category = catalog.find((c) => c.key.toLowerCase() === key.trim().toLowerCase());
+  if (!category) {
+    const available = catalog
+      .map((c) => `\`${c.key}\``)
+      .slice(0, 15)
+      .join(", ");
+    return { ok: false, message: `\`${key}\` isn't a trait category for this collection. Available: ${available}${catalog.length > 15 ? ", …" : ""}` };
+  }
+
+  const matched = category.values.find((v) => v.toLowerCase() === value.trim().toLowerCase());
+  if (!matched) {
+    const available = category.values
+      .map((v) => `\`${v}\``)
+      .slice(0, 15)
+      .join(", ");
+    return {
+      ok: false,
+      message: `\`${value}\` isn't a value of \`${category.key}\` for this collection. Available: ${available}${category.values.length > 15 ? ", …" : ""}`,
+    };
+  }
+
+  return { ok: true, trait: { key: category.key, value: matched } };
 }
 
 /** Matches /watchlist remove's input against an entry by address, id, or a label substring — in that order of preference. */

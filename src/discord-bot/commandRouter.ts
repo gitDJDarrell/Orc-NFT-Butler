@@ -1,13 +1,13 @@
 import type { ResolvedCollection } from "../opensea/client.js";
 import type { PortfolioSnapshot } from "../portfolio/portfolio.js";
-import type { CollectionInfo, CollectionOfferInfo, ListingInfo } from "../types/index.js";
+import type { CollectionInfo, CollectionOfferInfo, ListingInfo, Trait, TraitCategory } from "../types/index.js";
 import {
   ENTRY_SETTING_KEYS,
   GLOBAL_SETTING_KEYS,
   type EntrySettingKey,
   type GlobalSettingKey,
 } from "../watchlist/configMutate.js";
-import type { LeadRuleCondition, LeadRuleParams } from "../watchlist/mutate.js";
+import { validateTraitAgainstCatalog, type LeadRuleCondition, type LeadRuleParams } from "../watchlist/mutate.js";
 import { findWatchlistNameMatch, suggestClosestWatchlistEntry } from "../watchlist/resolveInput.js";
 import type { AllowlistEntry } from "../watchlist/schema.js";
 import type { WatchedItem } from "../watchlist/watchStore.js";
@@ -62,6 +62,8 @@ export interface CommandInvocation {
 export interface PendingAddPreview {
   resolved: ResolvedCollection;
   floor: CollectionInfo | null;
+  /** Validated trait scope, when the user supplied one. */
+  trait?: Trait;
 }
 
 export interface CommandReply {
@@ -107,7 +109,9 @@ export interface CommandRouterDeps {
   /** Live ETH/USD rate for "(~$X)" price suffixes — undefined shows ETH only (see OpenSeaClient.getEthUsdRate). */
   getEthUsdRate: () => Promise<number | undefined>;
   listWatchlistEntries: () => AllowlistEntry[];
-  addWatchlistEntry: (resolved: ResolvedCollection, floor: CollectionInfo | null) => AddWatchlistOutcome;
+  addWatchlistEntry: (resolved: ResolvedCollection, floor: CollectionInfo | null, trait?: Trait) => AddWatchlistOutcome;
+  /** A collection's real trait catalog — used to validate a requested trait before it's accepted. */
+  getCollectionTraits: (collectionIdOrSlug: string) => Promise<TraitCategory[]>;
   removeWatchlistEntry: (input: string, resolvedAddress: string | null) => RemoveWatchlistOutcome;
   createLeadRule: (resolved: ResolvedCollection, params: LeadRuleParams) => CreateLeadRuleOutcome;
   getStatusInfo: () => StatusInfo;
@@ -230,6 +234,28 @@ async function handleWatchlist(deps: CommandRouterDeps, invocation: CommandInvoc
     }
     const resolved = resolution.resolved;
 
+    // Optional trait scope. Both halves are required together, and the pair
+    // is checked against the collection's real catalog before anything is
+    // previewed — a typo'd trait would otherwise create an entry that can
+    // never match a single listing.
+    const rawCategory = isHintValue(invocation.traitCategory) ? undefined : invocation.traitCategory?.trim();
+    const rawValue = isHintValue(invocation.traitValue) ? undefined : invocation.traitValue?.trim();
+
+    if ((rawCategory && !rawValue) || (!rawCategory && rawValue)) {
+      return {
+        content: "Provide **both** `trait_category` and `trait_value` to scope this collection to a trait, or neither to watch the whole collection.",
+        ephemeral: true,
+      };
+    }
+
+    let trait: Trait | undefined;
+    if (rawCategory && rawValue) {
+      const catalog = await deps.getCollectionTraits(resolved.address).catch(() => [] as TraitCategory[]);
+      const validated = validateTraitAgainstCatalog(catalog, rawCategory, rawValue);
+      if (!validated.ok) return { content: `⚠️ ${validated.message}`, ephemeral: true };
+      trait = validated.trait;
+    }
+
     let floor: CollectionInfo | null = null;
     try {
       floor = await deps.getFloor(resolved.address);
@@ -245,9 +271,9 @@ async function handleWatchlist(deps: CommandRouterDeps, invocation: CommandInvoc
     // Confirm/Cancel buttons and only calls addWatchlistEntry() once the
     // authorized user clicks Confirm (see PendingAddStore).
     return {
-      embed: buildAddPreviewEmbed(resolved, floor, collectionImage?.imageUrl, ethUsdRate),
+      embed: buildAddPreviewEmbed(resolved, floor, collectionImage?.imageUrl, ethUsdRate, trait),
       ephemeral: true,
-      pendingAdd: { resolved, floor },
+      pendingAdd: { resolved, floor, trait },
     };
   }
 
