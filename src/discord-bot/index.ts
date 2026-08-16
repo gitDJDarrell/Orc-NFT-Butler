@@ -39,6 +39,7 @@ export async function startDiscordBot(agent: NftDeFiAgent): Promise<DiscordBotHa
     onWatchedDelisted: async (item) => bot.notifyWatchedDelisted(item),
     onWhaleActivity: async (activity) => bot.postWhaleActivity(activity),
     onRecap: async (summary, charts) => bot.postRecap(summary, charts),
+    onHighestOffer: async (event) => bot.postHighestOffer(event),
   });
 
   bot = createDiscordBotClient(agent, leadMonitor);

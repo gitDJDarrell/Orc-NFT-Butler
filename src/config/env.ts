@@ -84,6 +84,8 @@ const envSchema = z.object({
   DISCORD_WHALE_CHANNEL_ID: z.string().optional().default(""),
   /** Once-daily overnight recap + the twice-daily trend digest's chart. Falls back to the trend-alerts channel when unset. */
   DISCORD_RECAP_CHANNEL_ID: z.string().optional().default(""),
+  /** New record-high offers on allowlisted collections. Falls back to the trend-alerts channel when unset. Created by `npm run setup-server`. */
+  DISCORD_HIGHEST_OFFERS_CHANNEL_ID: z.string().optional().default(""),
   /** The only Discord user ID whose reactions on bid-lead messages, and whose slash-command invocations, are honored. */
   DISCORD_AUTHORIZED_USER_ID: z.string().optional().default(""),
   /** Optional: pin slash-command registration to one guild ID. If unset, commands register in every guild the bot is currently in. */

@@ -5,6 +5,7 @@ import type { Alert, CollectionInfo, CollectionOfferInfo, DryRunResult, ListingI
 import type { PortfolioSnapshot } from "../portfolio/portfolio.js";
 import type { BidLeadCandidate } from "../watchlist/candidate.js";
 import type { WatchlistMatch } from "../watchlist/evaluate.js";
+import type { HighestOfferEvent } from "../watchlist/leadMonitor.js";
 import type { RecapCollectionLine, RecapSummary } from "../watchlist/recap.js";
 import type { AllowlistEntry } from "../watchlist/schema.js";
 import type { WatchedItem } from "../watchlist/watchStore.js";
@@ -546,6 +547,14 @@ export function buildHelpEmbed(): EmbedContent {
         inline: false,
       },
       {
+        name: "💰 #highest-offers",
+        value:
+          "Fires when a watched collection's top offer sets a **new record high** — max across collection-wide, trait, and item offers. " +
+          "Shows amount (ETH + USD), offer type, offerer, and the delta vs. the previous high. Not a feed of every offer: standing offers " +
+          "never repost, and the current high is baselined silently on first run so restarts don't replay it.",
+        inline: false,
+      },
+      {
         name: "Bid-lead cards (#bid-leads)",
         value:
           "Accept/Deny/Watch buttons (or react ✅❌👀) — Accept shows a Confirm/Cancel step first (builds a DRY-RUN order only, nothing is signed). " +
@@ -721,6 +730,46 @@ export function buildRecapEmbed(summary: RecapSummary): EmbedContent {
       summary.ethUsdRate !== undefined,
     ),
     timestamp: summary.generatedAt,
+  };
+}
+
+/**
+ * A new record-high offer on a watched collection (#highest-offers). Only
+ * ever built for a genuine new record — baselines and non-records never
+ * reach here (see leadMonitor.checkHighestOffer).
+ */
+export function buildHighestOfferEmbed(event: HighestOfferEvent): EmbedContent {
+  const { record, previous, ethUsdRate } = event;
+  const priceText = formatPriceWithUsd(record.priceNative, record.priceCurrency, { ethUsdRate });
+  const previousText = formatPriceWithUsd(previous.priceNative, previous.priceCurrency, { ethUsdRate });
+
+  const scopeLabel =
+    record.scope === "collection"
+      ? "collection-wide"
+      : record.scope === "trait"
+        ? "trait offer"
+        : `item offer${record.tokenId ? ` (#${record.tokenId})` : ""}`;
+
+  const pct = previous.priceNative > 0 ? ((record.priceNative - previous.priceNative) / previous.priceNative) * 100 : null;
+  const deltaText = pct !== null ? `▲ **new high ${record.priceNative} ${record.priceCurrency}**, up from ${previous.priceNative} (+${pct.toFixed(1)}%)` : `▲ **new high ${record.priceNative} ${record.priceCurrency}**`;
+
+  const links = [`[OpenSea](https://opensea.io/assets/ethereum/${event.collectionId})`, `[Etherscan: offerer](https://etherscan.io/address/${record.bidder})`];
+  if (record.tokenId) links.unshift(`[Item](https://opensea.io/assets/ethereum/${event.collectionId}/${record.tokenId})`);
+
+  return {
+    title: `💰 New highest offer — ${event.collectionName}`,
+    description: deltaText,
+    color: COLOR_ACCEPT,
+    fields: [
+      { name: "Offer", value: priceText, inline: true },
+      { name: "Previous high", value: previousText, inline: true },
+      { name: "Type", value: scopeLabel, inline: true },
+      { name: "Offerer", value: shortAddress(record.bidder), inline: true },
+      { name: "Links", value: links.join(" · "), inline: false },
+    ],
+    thumbnail: event.collectionImageUrl,
+    footer: withUsdFootnote("Record high across collection, trait, and item offers.", ethUsdRate !== undefined),
+    timestamp: record.recordedAt,
   };
 }
 

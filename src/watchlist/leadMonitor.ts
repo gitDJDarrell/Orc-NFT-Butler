@@ -9,10 +9,12 @@ import {
   getTrendAlertTimes,
 } from "../config/runtime.js";
 import { formatPriceWithUsd, openseaClient } from "../opensea/client.js";
-import type { Alert, CollectionInfo, ListingInfo, SaleInfo, Trait } from "../types/index.js";
+import type { Alert, CollectionInfo, CollectionOfferInfo, ListingInfo, SaleInfo, Trait } from "../types/index.js";
 import type { BidLeadCandidate } from "./candidate.js";
 import { evaluateCandidate, type WatchlistMatch } from "./evaluate.js";
 import { renderFloorChart } from "../chart/floorChart.js";
+import { decideHighestOffer } from "./highestOffer.js";
+import { HighestOfferStore, type HighestOfferRecord } from "./highestOfferStore.js";
 import { FloorHistoryStore, type FloorSample } from "./historyStore.js";
 import { ListingAnchorStore } from "./listingAnchorStore.js";
 import { LeadLimiter } from "./limiter.js";
@@ -29,6 +31,7 @@ const LISTING_ANCHOR_STORE_PATH = resolve(process.cwd(), ".watchlist-listing-anc
 const WATCH_STORE_PATH = resolve(process.cwd(), ".watchlist-watched-items.json");
 const WHALE_STORE_PATH = resolve(process.cwd(), ".watchlist-whales.json");
 const HISTORY_STORE_PATH = resolve(process.cwd(), ".watchlist-floor-history.json");
+const HIGHEST_OFFER_STORE_PATH = resolve(process.cwd(), ".watchlist-highest-offers.json");
 
 /** Consecutive poll ticks a watched token can go missing from both recent-listings and recent-sales before it's treated as likely delisted. See WatchedItem.missingTicks for the caveat. */
 const DELIST_THRESHOLD_TICKS = 3;
@@ -50,6 +53,18 @@ export type AlertHandler = (alert: Alert) => void | Promise<void>;
 export type SaleHandler = (sale: SaleInfo, collectionName: string, ethUsdRate: number | undefined) => void | Promise<void>;
 /** A marked wallet bought/sold/listed inside an allowlisted collection (Group 3.2). */
 export type WhaleActivityHandler = (activity: WhaleActivity) => void | Promise<void>;
+
+/** A collection's top offer set a new record high — see checkHighestOffer. */
+export interface HighestOfferEvent {
+  collectionId: string;
+  collectionName: string;
+  collectionImageUrl?: string;
+  record: HighestOfferRecord;
+  /** The high this beat. */
+  previous: HighestOfferRecord;
+  ethUsdRate?: number;
+}
+export type HighestOfferHandler = (event: HighestOfferEvent) => void | Promise<void>;
 /** The once-daily overnight recap, with an optional locally-rendered chart PNG per collection. */
 export type RecapHandler = (summary: RecapSummary, charts: Array<{ label: string; png: Buffer }>) => void | Promise<void>;
 /** The twice-daily trend digest, optionally carrying a locally-rendered chart PNG. */
@@ -160,11 +175,13 @@ export interface BidLeadMonitorOptions {
   onWatchedDelisted?: WatchedDelistedHandler;
   onWhaleActivity?: WhaleActivityHandler;
   onRecap?: RecapHandler;
+  onHighestOffer?: HighestOfferHandler;
   seenStore?: SeenStore;
   listingAnchorStore?: ListingAnchorStore;
   watchStore?: WatchStore;
   whaleStore?: WhaleStore;
   historyStore?: FloorHistoryStore;
+  highestOfferStore?: HighestOfferStore;
 }
 
 export class BidLeadMonitor {
@@ -189,6 +206,8 @@ export class BidLeadMonitor {
   private readonly onWatchedDelisted: WatchedDelistedHandler | undefined;
   private readonly onWhaleActivity: WhaleActivityHandler | undefined;
   private readonly onRecap: RecapHandler | undefined;
+  private readonly onHighestOffer: HighestOfferHandler | undefined;
+  private readonly highestOfferStore: HighestOfferStore;
   private readonly listingAnchorStore: ListingAnchorStore;
   private timer: ReturnType<typeof setInterval> | null = null;
   private trendTimers: ReturnType<typeof setTimeout>[] = [];
@@ -231,6 +250,8 @@ export class BidLeadMonitor {
     this.onWatchedDelisted = options.onWatchedDelisted;
     this.onWhaleActivity = options.onWhaleActivity;
     this.onRecap = options.onRecap;
+    this.onHighestOffer = options.onHighestOffer;
+    this.highestOfferStore = options.highestOfferStore ?? new HighestOfferStore(HIGHEST_OFFER_STORE_PATH);
     this.seenStore = options.seenStore ?? new SeenStore(SEEN_STORE_PATH);
     this.listingAnchorStore = options.listingAnchorStore ?? new ListingAnchorStore(LISTING_ANCHOR_STORE_PATH);
     this.watchStore = options.watchStore ?? new WatchStore(WATCH_STORE_PATH);
@@ -324,6 +345,7 @@ export class BidLeadMonitor {
       this.lastTrendFloor.delete(id);
       this.recapCounters.delete(id);
       this.historyStore.forget(id);
+      this.highestOfferStore.forget(id); // re-added later re-baselines rather than comparing against a stale high
       this.seenStore.forget(id); // if re-added later, it re-baselines from scratch rather than acting on years-stale dedupe state
     }
     for (const id of added) {
@@ -574,9 +596,17 @@ export class BidLeadMonitor {
         await this.emitListingRecurrence(listing, floor.name, imageUrl, ethUsdRate);
       }
 
-      // Only spend the extra collection-offers read when there's actually
-      // something actionable this tick to compare against it.
-      const topCollectionOfferNative = actionable.length > 0 ? await this.getTopCollectionOfferPrice(collectionId) : undefined;
+      // ONE offers read per tick, shared by both consumers below. Previously
+      // this was fetched only when something was actionable, and only for
+      // the above-market check; #highest-offers needs it every tick, and
+      // sharing the result means the two features cost one call between
+      // them rather than one each.
+      const offers = this.onHighestOffer || actionable.length > 0 ? await this.fetchCollectionOffers(collectionId) : [];
+
+      await this.checkHighestOffer(collectionId, floor, offers, ethUsdRate);
+
+      const collectionScoped = offers.filter((o) => o.scope === "collection");
+      const topCollectionOfferNative = collectionScoped.length > 0 ? Math.max(...collectionScoped.map((o) => o.priceNative)) : undefined;
 
       for (const listing of actionable) {
         const [{ imageUrl, traits }, lastSale] = await Promise.all([
@@ -845,17 +875,78 @@ export class BidLeadMonitor {
     }
   }
 
-  /** Highest currently active collection-wide (not trait/token) offer for a collection, or undefined if none/unavailable. */
-  private async getTopCollectionOfferPrice(collectionId: string): Promise<number | undefined> {
+  /** All active offers (collection / trait / item scoped) for a collection. Never throws — a failed read degrades to "no offers this tick". */
+  private async fetchCollectionOffers(collectionId: string): Promise<CollectionOfferInfo[]> {
     try {
-      const offers = await openseaClient.getCollectionOffers(collectionId, 20);
-      const collectionScoped = offers.filter((o) => o.scope === "collection");
-      if (collectionScoped.length === 0) return undefined;
-      return Math.max(...collectionScoped.map((o) => o.priceNative));
+      return await openseaClient.getCollectionOffers(collectionId, 20);
     } catch (err) {
       console.warn(`[offers] failed to fetch collection offers for ${collectionId}: ${(err as Error).message}`);
-      return undefined;
+      return [];
     }
+  }
+
+  /**
+   * #highest-offers: posts ONLY when a collection's top offer sets a new
+   * record. Reads the offers array this tick already fetched, so it adds no
+   * call of its own.
+   *
+   * "Highest" is the max across every scope OpenSea reports — collection,
+   * trait, and item — because the headline number a watcher cares about is
+   * the best anyone will currently pay for anything in the collection.
+   *
+   * No-backfill: a collection with no stored record baselines SILENTLY, the
+   * same posture as listings/sales, so a restart (or adding a collection)
+   * never dumps the existing high as though it just appeared. See
+   * decideHighestOffer for the full rule set, including why an expired
+   * record re-baselines instead of posting.
+   */
+  private async checkHighestOffer(
+    collectionId: string,
+    floor: CollectionInfo,
+    offers: CollectionOfferInfo[],
+    ethUsdRate: number | undefined,
+  ): Promise<void> {
+    if (!this.onHighestOffer) return;
+
+    const entry = this.watchlistConfig.entries.find((e) => e.enabled && e.collection.toLowerCase() === collectionId.toLowerCase());
+    if (!entry) return; // allowlist-only, same posture as every other emission path
+
+    const decision = decideHighestOffer(offers, this.highestOfferStore.get(collectionId));
+
+    if (decision.action === "none") return;
+
+    if (decision.action === "baseline") {
+      this.highestOfferStore.set(collectionId, decision.record);
+      console.log(
+        `[highest-offer] Baselined ${floor.name} at ${decision.record.priceNative} ${decision.record.priceCurrency} ` +
+          `(${decision.reason}) — recorded WITHOUT posting.`,
+      );
+      return;
+    }
+
+    // Rate-limited/deduped through the same per-entry limiter as every other
+    // signal, under its own key namespace so it can never suppress (or be
+    // suppressed by) leads, sales, offers, or whale activity for this entry.
+    const dedupeKey = `highest-offer:${collectionId}:${decision.record.offerId}`;
+    if (this.limiter.check(entry, dedupeKey)) return;
+    this.limiter.recordFired(entry, dedupeKey);
+
+    this.highestOfferStore.set(collectionId, decision.record);
+    const collectionImage = await openseaClient.getCollectionImage(collectionId).catch(() => null);
+
+    console.log(
+      `[highest-offer] NEW RECORD for ${floor.name}: ${decision.record.priceNative} ${decision.record.priceCurrency} ` +
+        `(was ${decision.previous.priceNative}) scope=${decision.record.scope}.`,
+    );
+
+    await this.onHighestOffer({
+      collectionId,
+      collectionName: floor.name,
+      collectionImageUrl: collectionImage?.imageUrl,
+      record: decision.record,
+      previous: decision.previous,
+      ethUsdRate,
+    });
   }
 
   /**
@@ -1054,11 +1145,13 @@ export class BidLeadMonitor {
           if (Math.abs(change) < getFloorMoveThreshold()) return;
 
           const direction = change > 0 ? "up" : "down";
-          const [collectionImage, topCollectionOfferNative, ethUsdRate] = await Promise.all([
+          const [collectionImage, trendOffers, ethUsdRate] = await Promise.all([
             openseaClient.getCollectionImage(collectionId),
-            this.getTopCollectionOfferPrice(collectionId),
+            this.fetchCollectionOffers(collectionId),
             openseaClient.getEthUsdRate(),
           ]);
+          const trendCollectionScoped = trendOffers.filter((o) => o.scope === "collection");
+          const topCollectionOfferNative = trendCollectionScoped.length > 0 ? Math.max(...trendCollectionScoped.map((o) => o.priceNative)) : undefined;
           const topOfferText =
             topCollectionOfferNative !== undefined
               ? ` Top collection offer: ${formatPriceWithUsd(topCollectionOfferNative, floor.floorPriceCurrency, { ethUsdRate })}.`

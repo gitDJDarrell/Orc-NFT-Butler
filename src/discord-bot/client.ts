@@ -17,7 +17,7 @@ import { config } from "../config/env.js";
 import { openseaClient, type ResolvedCollection } from "../opensea/client.js";
 import type { Alert, CollectionInfo, SaleInfo, Trait } from "../types/index.js";
 import type { BidLeadCandidate } from "../watchlist/candidate.js";
-import type { BidLeadMonitor } from "../watchlist/leadMonitor.js";
+import type { BidLeadMonitor, HighestOfferEvent } from "../watchlist/leadMonitor.js";
 import type { WatchlistMatch } from "../watchlist/evaluate.js";
 import { describeSettings } from "../config/runtime.js";
 import { buildPortfolioSnapshot, getCachedPortfolioAddress } from "../portfolio/portfolio.js";
@@ -45,6 +45,7 @@ import {
   applyLeadDecision,
   buildAlertEmbed,
   buildBidLeadEmbed,
+  buildHighestOfferEmbed,
   buildListingStatusEmbed,
   buildRecapEmbed,
   buildSaleEmbed,
@@ -72,6 +73,8 @@ export interface DiscordBotClient {
   postTrendAlertWithChart(alert: Alert, chart: { label: string; png: Buffer } | undefined): Promise<void>;
   /** Once-daily overnight recap, with up to a handful of charts attached. */
   postRecap(summary: RecapSummary, charts: Array<{ label: string; png: Buffer }>): Promise<void>;
+  /** A watched collection's top offer set a new record high. */
+  postHighestOffer(event: HighestOfferEvent): Promise<void>;
   /** Returns the posted message's ID (so BidLeadMonitor can anchor future thread recurrence/price-change updates to it), or undefined if nothing was posted. */
   postNewListing(alert: Alert): Promise<string | undefined>;
   postTrendAlert(alert: Alert): Promise<void>;
@@ -875,6 +878,16 @@ export function createDiscordBotClient(agent: NftDeFiAgent, leadMonitor: BidLead
       // Point the embed's image at the attachment we're uploading alongside it.
       const name = chartFileName(chart.label, 0);
       await sendEmbedsWithCharts(config.DISCORD_TREND_ALERTS_CHANNEL_ID, [{ ...embed, image: `attachment://${name}` }], [chart]);
+    },
+    async postHighestOffer(event) {
+      // Defense in depth: leadMonitor only ever evaluates allowlisted
+      // collections, but every emission path checks explicitly.
+      if (!isAllowlisted(event.collectionId)) {
+        console.warn(`[discord-bot] Refusing to post highest offer for non-allowlisted collection ${event.collectionId}.`);
+        return;
+      }
+      const channelId = config.DISCORD_HIGHEST_OFFERS_CHANNEL_ID || config.DISCORD_TREND_ALERTS_CHANNEL_ID;
+      await sendEmbed(channelId, undefined, buildHighestOfferEmbed(event));
     },
     async postRecap(summary, charts) {
       const channelId = config.DISCORD_RECAP_CHANNEL_ID || config.DISCORD_TREND_ALERTS_CHANNEL_ID;

@@ -100,10 +100,19 @@ async function main(): Promise<void> {
     notifCategory.id,
     "Recent sales for your watched collections — bot-only feed.",
   );
+  const highestOffers = await ensureTextChannel(
+    rest,
+    guild.id,
+    channels,
+    "highest-offers",
+    notifCategory.id,
+    "New record-high offers on watched collections — bot-only feed.",
+  );
   channels = (await rest.get(`/guilds/${guild.id}/channels`)) as DiscordChannel[];
 
   ensureEnvVar("DISCORD_SALES_CHANNEL_ID", watchlistSales.id, true);
   ensureEnvVar("DISCORD_STATUS_CHANNEL_ID", butlerStatus.id, true);
+  ensureEnvVar("DISCORD_HIGHEST_OFFERS_CHANNEL_ID", highestOffers.id, true);
 
   const bidLeads = requireExistingChannel(channels, config.DISCORD_BID_LEADS_CHANNEL_ID, "bid-leads");
   const newListings = requireExistingChannel(channels, config.DISCORD_NEW_LISTINGS_CHANNEL_ID, "new-listings");
@@ -117,9 +126,18 @@ async function main(): Promise<void> {
   // so applying the bot's explicit "allow Send Messages" here first is what
   // guarantees the posts below succeed even if a parent category has a
   // restrictive overwrite the bot would otherwise inherit.
-  const readOnlyChannels = [welcome, howItWorks, serverGuide, butlerStatus, newListings, trendAlerts, orderLog, auditLog, watchlistSales].filter(
-    (c): c is DiscordChannel => c !== null,
-  );
+  const readOnlyChannels = [
+    welcome,
+    howItWorks,
+    serverGuide,
+    butlerStatus,
+    newListings,
+    trendAlerts,
+    orderLog,
+    auditLog,
+    watchlistSales,
+    highestOffers,
+  ].filter((c): c is DiscordChannel => c !== null);
   for (const channel of readOnlyChannels) {
     await lockToReadOnly(rest, guild.id, me.id, channel);
   }
@@ -453,7 +471,8 @@ function buildSopEmbeds(): ReturnType<EmbedBuilder["toJSON"]>[] {
           "  Also carries 👀 watch follow-ups (price drop, sold, likely delisted) and 🐋 whale activity unless a separate channel is configured.\n" +
           "#new-listings — new listings for allowlisted collections (hourly)\n" +
           "#trend-alerts — twice-daily trend/floor digest at 8:00 AM & 8:00 PM local, each with a floor/volume chart; also the 🌅 once-daily overnight recap\n" +
-          "#watchlist-sales — recent sales for your watched collections (hourly, bot-only feed)",
+          "#watchlist-sales — recent sales for your watched collections (hourly, bot-only feed)\n" +
+          "#highest-offers — new RECORD-HIGH offers on watched collections (hourly, bot-only feed). Only fires when the top offer beats the previous high — not every offer.",
         inline: false,
       },
       {
@@ -553,6 +572,16 @@ function buildCommandsEmbeds(): ReturnType<EmbedBuilder["toJSON"]>[] {
           "Holdings for the configured public address (resolved from an ENS name), grouped by collection with floor value and offers received.\n" +
           "**This is strictly read-only.** The bot holds no private key or seed phrase, performs no wallet connection, signs nothing, and " +
           "cannot buy, sell, transfer, or approve anything. ENS resolution and all portfolio reads are read-only calls against public data.",
+        inline: false,
+      },
+      {
+        name: "💰 #highest-offers",
+        value:
+          "Posts when a watched collection's **top offer sets a new record high** — the max across collection-wide, trait, and item offers. " +
+          "Shows the amount (ETH + USD), the offer type, the offerer, and the delta vs. the previous high.\n" +
+          "It is NOT a feed of every offer: a standing offer never reposts, and the current high is recorded silently on first run so a restart " +
+          "never replays it as if it were new. If the record-setting offer expires, the bar re-baselines to the current high (silently) so the " +
+          "channel can't be muted forever by one outlier.",
         inline: false,
       },
       {

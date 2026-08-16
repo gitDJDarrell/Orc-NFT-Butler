@@ -115,6 +115,7 @@ them is safe — each one rebuilds itself, at the cost of re-baselining.
 | `.watchlist-watched-items.json` | The 👀 watch set (Group 3.1) |
 | `.watchlist-whales.json` | Tracked whale wallets (Group 3.2) |
 | `.watchlist-floor-history.json` | Floor/volume time series behind charts + recap (Group 3.3) |
+| `.watchlist-highest-offers.json` | Per-collection record-high offer behind #highest-offers |
 | `.bot.lock` / `.bot.pid` | Single-instance guard |
 
 ## Setup
@@ -822,6 +823,54 @@ Measured on the live #327 case: 4 alternating posts per tick before, exactly
 1 after collapsing, and 0 (thread update only) once the ladder's drift fell
 under the threshold — with the anchor stable across consecutive polls.
 
+### Highest offers 💰
+
+`#highest-offers` fires when a watched collection's **top offer sets a new
+record high** — not on every offer. "Highest" is the max across **every**
+scope OpenSea reports (collection-wide, trait, and item), because the number
+worth knowing is the best anyone will currently pay for anything in the
+collection.
+
+The embed carries: collection name + image, the offer amount in **ETH and
+USD**, the **offer type** (collection-wide / trait / item, with the token id
+when available), the **offerer** (short `0x…` form, linked to Etherscan), and
+the **delta vs. the previous high** — e.g. *"▲ new high 0.21 WETH, up from
+0.18 (+16.7%)"*.
+
+The rules, in `decideHighestOffer` (pure and unit-tested):
+
+| Situation | Result |
+| --- | --- |
+| No stored record (first run, or newly added collection) | **Baseline silently** — records the current high, posts nothing |
+| Same offer still on top | Nothing — a standing offer must not repost every hour |
+| Strictly higher than the stored high | **Post**, and store the new record |
+| Equal to the stored high | Nothing — matching isn't beating |
+| The record-setting offer is no longer active | **Re-baseline silently** to the current high |
+
+That last rule matters: without it, one outlier offer would raise the bar
+permanently and the channel would go silent forever once it expired. With it,
+the bar follows reality — but it only ever *drops* silently, never as a
+notification.
+
+The baseline rule is the same no-backfill posture as listings and sales: a
+restart, or adding a collection, never dumps the existing high as though it
+just appeared. Records persist in `.watchlist-highest-offers.json`.
+
+Allowlist-only and routed through the same per-entry `LeadLimiter` as every
+other signal, under its own `highest-offer:` key namespace so it can't
+suppress (or be suppressed by) leads, sales, offers, or whale activity.
+
+It rides the existing hourly poll — no new schedule. The offers read is now
+fetched **once per tick and shared** with the above-market-offer check that
+already needed it, so the two features cost one call between them rather than
+one each. (Previously that read was skipped on ticks with nothing actionable;
+now it happens every tick, which is one extra call per collection per hour —
+negligible against the request budget, and the honest tradeoff for the
+feature.)
+
+Posts to `DISCORD_HIGHEST_OFFERS_CHANNEL_ID` if set, otherwise the
+trend-alerts channel.
+
 ### Watching items 👀
 
 Marking a bid lead 👀 (the **Watch** button, or the reaction) adds that
@@ -1528,7 +1577,8 @@ See `.env.example` for the full list with inline documentation:
 `TREND_ALERT_TIMES`, `OFFER_ABOVE_COLLECTION_THRESHOLD_PERCENT`,
 `SALES_LOOKBACK_MINUTES`, `SHOW_USD`, `OPENSEA_REQUESTS_PER_MINUTE`, `WATCHLIST_CONFIG_PATH`.
 
-Added for Group 3: `DISCORD_WHALE_CHANNEL_ID`, `DISCORD_RECAP_CHANNEL_ID`,
+Added for Group 3: `DISCORD_HIGHEST_OFFERS_CHANNEL_ID`,
+`DISCORD_WHALE_CHANNEL_ID`, `DISCORD_RECAP_CHANNEL_ID`,
 `DAILY_RECAP_TIME`, `TREND_CHARTS_ENABLED`, `PRICE_CHANGE_MIN_PERCENT`,
 `PORTFOLIO_ENS_NAME`, `PORTFOLIO_ADDRESS`, `ETH_RPC_URLS`.
 
